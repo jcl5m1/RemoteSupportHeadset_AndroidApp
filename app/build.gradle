@@ -1,0 +1,62 @@
+plugins {
+    id 'com.android.application'
+    id 'kotlin-android'
+}
+
+android {
+    namespace 'com.example.remotesupportheadset'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.example.remotesupportheadset"
+        minSdk 21
+        targetSdk 33
+        versionCode 1
+        versionName "1.0"
+
+        ndk {
+            abiFilters 'armeabi-v7a', 'arm64-v8a'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    kotlinOptions {
+        jvmTarget = '1.8'
+    }
+
+    packagingOptions {
+        pickFirst '**/libc++_shared.so'
+        pickFirst '**/libUVCCamera.so'
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core-ktx:1.12.0'
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'com.google.android.material:material:1.11.0'
+    implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+
+    // UVC multi-camera library
+    implementation('com.github.jiangdongguo.AndroidUSBCamera:libausbc:3.2.7') {
+        exclude group: 'com.gyf.immersionbar', module: 'immersionbar'
+        exclude group: 'com.zlc.glide', module: 'webpdecoder'
+    }
+    implementation 'com.github.jiangdongguo.AndroidUSBCamera:libuvc:3.2.7'
+
+    // Manual additions from MavenCentral to avoid JitPack 401 errors
+    implementation 'com.geyifeng.immersionbar:immersionbar:3.2.2'
+    implementation 'com.github.zjupure:webpdecoder:2.7.4.16.0'
+}
+
+apply from: 'test.gradle'

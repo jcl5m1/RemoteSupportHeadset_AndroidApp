@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Remote Support Headset</string>
+    <string name="btn_open_cameras">Open Dual Camera View</string>
+    <string name="label_camera_1">Camera 1</string>
+    <string name="label_camera_2">Camera 2</string>
+    <string name="waiting_for_camera">Waiting for camera…</string>
+</resources>

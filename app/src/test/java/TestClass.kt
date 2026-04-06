@@ -1,14 +1,17 @@
 package com.example.remotesupportheadset
 
-import com.jiangdg.ausbc.callback.IDeviceConnectCallBack
+import org.junit.Test
 import java.lang.reflect.Method
 
-fun test() {
-    val methods = IDeviceConnectCallBack::class.java.methods
-    for (m in methods) {
-        println(m.name)
-        for (p in m.parameterTypes) {
-            println(p.name)
+class TestClass {
+    @Test
+    fun printTypes() {
+        val methods = Class.forName("com.jiangdg.ausbc.callback.IDeviceConnectCallBack").methods
+        for (m in methods) {
+            println(m.name)
+            for (p in m.parameterTypes) {
+                println("PARAM: " + p.name)
+            }
         }
     }
 }
