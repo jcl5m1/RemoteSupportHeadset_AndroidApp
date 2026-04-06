@@ -1,21 +1,33 @@
 package com.example.remotesupportheadset
 
 import android.Manifest
+import android.annotation.SuppressLint
+import android.content.Context
 import android.content.pm.PackageManager
 import android.hardware.usb.UsbDevice
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.ToneGenerator
 import android.media.audiofx.Visualizer
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.view.GestureDetector
+import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.View
+import android.view.ViewGroup
+import android.widget.LinearLayout
 import android.widget.ProgressBar
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import androidx.constraintlayout.widget.ConstraintLayout
+import androidx.constraintlayout.widget.ConstraintSet
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
@@ -26,6 +38,7 @@ import com.jiangdg.ausbc.callback.IDeviceConnectCallBack
 import com.jiangdg.ausbc.camera.bean.CameraRequest
 import com.jiangdg.ausbc.widget.AspectRatioTextureView
 import com.serenegiant.usb.USBMonitor
+import kotlin.math.sqrt
 
 class DualCameraActivity : AppCompatActivity() {
 
@@ -35,6 +48,7 @@ class DualCameraActivity : AppCompatActivity() {
         private const val PREVIEW_HEIGHT = 480
         private const val REQUEST_CAMERA_PERMISSION = 1001
         private const val OVERLAY_TIMEOUT_MS = 5000L
+        private const val ZOOM_TIMEOUT_MS = 2000L
     }
 
     private lateinit var textureLeft: AspectRatioTextureView
@@ -45,6 +59,23 @@ class DualCameraActivity : AppCompatActivity() {
     private lateinit var labelRight: TextView
     private lateinit var meterMic: ProgressBar
     private lateinit var meterSpeaker: ProgressBar
+    private lateinit var seekMicGain: SeekBar
+    private lateinit var seekSpeakerGain: SeekBar
+
+    private lateinit var containerLeft: View
+    private lateinit var containerRight: View
+    private lateinit var divider: View
+    
+    private lateinit var rootLayout: ConstraintLayout
+    private lateinit var containerCamerasParent: LinearLayout
+    private lateinit var containerControls: LinearLayout
+    private lateinit var sectionMic: LinearLayout
+    private lateinit var sectionSpeaker: LinearLayout
+
+    private var micGain: Float = 1.0f
+    private var speakerGain: Float = 1.0f
+    private var toneGenerator: ToneGenerator? = null
+    private lateinit var audioManager: AudioManager
 
     private val cameraMap = LinkedHashMap<Int, MultiCameraClient.Camera>(2)
     private lateinit var cameraClient: MultiCameraClient
@@ -54,6 +85,15 @@ class DualCameraActivity : AppCompatActivity() {
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val hideOverlayRunnable = Runnable { hideOverlays() }
+    
+    private val autoZoomRunnable = Runnable {
+        if (cameraMap.size == 1 && zoomedCameraId == null) {
+            Log.d(TAG, "Auto-zooming to Camera 1 after timeout")
+            toggleZoom(R.id.texture_camera_left)
+        }
+    }
+
+    private var zoomedCameraId: Int? = null // null: split, R.id.texture_camera_left, R.id.texture_camera_right
 
     // Audio meters
     private var audioRecord: AudioRecord? = null
@@ -61,10 +101,12 @@ class DualCameraActivity : AppCompatActivity() {
     private val micBuffer = ShortArray(1024)
     private var visualizer: Visualizer? = null
 
+    @SuppressLint("ClickableViewAccessibility")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_dual_camera)
 
+        audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         hideSystemUI()
 
         textureLeft  = findViewById(R.id.texture_camera_left)
@@ -75,15 +117,93 @@ class DualCameraActivity : AppCompatActivity() {
         labelRight   = findViewById(R.id.label_camera_right)
         meterMic     = findViewById(R.id.meter_mic)
         meterSpeaker = findViewById(R.id.meter_speaker)
+        seekMicGain  = findViewById(R.id.seek_mic_gain)
+        seekSpeakerGain = findViewById(R.id.seek_speaker_gain)
+
+        containerLeft  = findViewById(R.id.container_camera_left)
+        containerRight = findViewById(R.id.container_camera_right)
+        divider        = findViewById(R.id.divider_cameras)
+        
+        rootLayout = findViewById(R.id.root_layout)
+        containerCamerasParent = findViewById(R.id.container_cameras_parent)
+        containerControls = findViewById(R.id.container_controls)
+        sectionMic = findViewById(R.id.section_mic)
+        sectionSpeaker = findViewById(R.id.section_speaker)
+
+        // Use STREAM_MUSIC for both tone and volume control
+        toneGenerator = ToneGenerator(AudioManager.STREAM_MUSIC, 100)
+
+        // Mic Gain Slider - Max 400 (from XML)
+        seekMicGain.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                micGain = progress / 100.0f
+            }
+            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+            override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+        })
+
+        // Speaker Volume Slider - Matches System Volume
+        val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        seekSpeakerGain.max = maxVol
+        seekSpeakerGain.progress = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+        speakerGain = if (maxVol > 0) seekSpeakerGain.progress.toFloat() / maxVol else 0f
+
+        seekSpeakerGain.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                if (fromUser) {
+                    audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, progress, 0)
+                    playTestChime()
+                }
+                speakerGain = if (maxVol > 0) progress.toFloat() / maxVol else 0f
+            }
+            override fun onStartTrackingTouch(seekBar: SeekBar?) {
+                playTestChime()
+            }
+            override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+        })
 
         // Initially show labels, they will hide automatically after 5s
         showOverlaysTemporarily()
 
-        // Set up tap listener to show overlay
-        val clickListener = View.OnClickListener { showOverlaysTemporarily() }
-        textureLeft.setOnClickListener(clickListener)
-        textureRight.setOnClickListener(clickListener)
-        findViewById<View>(android.R.id.content).setOnClickListener(clickListener)
+        // Global gesture detector for background
+        val gestureDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onDown(e: MotionEvent): Boolean = true
+            override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
+                showOverlaysTemporarily()
+                return true
+            }
+            override fun onDoubleTap(e: MotionEvent): Boolean {
+                if (zoomedCameraId != null) {
+                    toggleZoom(zoomedCameraId!!)
+                }
+                return true
+            }
+        })
+
+        // Specific gesture listeners for textures
+        val createGestureListener = { viewId: Int ->
+            GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+                override fun onDown(e: MotionEvent): Boolean = true
+                override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
+                    showOverlaysTemporarily()
+                    return true
+                }
+                override fun onDoubleTap(e: MotionEvent): Boolean {
+                    toggleZoom(viewId)
+                    return true
+                }
+            })
+        }
+
+        val leftGD = createGestureListener(R.id.texture_camera_left)
+        val rightGD = createGestureListener(R.id.texture_camera_right)
+
+        textureLeft.setOnTouchListener { _, event -> leftGD.onTouchEvent(event) }
+        textureRight.setOnTouchListener { _, event -> rightGD.onTouchEvent(event) }
+        findViewById<View>(android.R.id.content).setOnTouchListener { _, event -> 
+            gestureDetector.onTouchEvent(event)
+            true
+        }
 
         cameraClient = MultiCameraClient(this, object : IDeviceConnectCallBack {
             override fun onAttachDev(device: UsbDevice?) {
@@ -129,9 +249,21 @@ class DualCameraActivity : AppCompatActivity() {
                     if (cameraMap.size == 1) {
                         statusLeft.visibility = View.GONE
                         labelLeft.text = "Camera 1\n$PREVIEW_WIDTH x $PREVIEW_HEIGHT @ 30 FPS"
+                        
+                        // Start 2s timer. If no 2nd camera connects, zoom to Camera 1.
+                        mainHandler.removeCallbacks(autoZoomRunnable)
+                        mainHandler.postDelayed(autoZoomRunnable, ZOOM_TIMEOUT_MS)
                     } else {
                         statusRight.visibility = View.GONE
                         labelRight.text = "Camera 2\n$PREVIEW_WIDTH x $PREVIEW_HEIGHT @ 30 FPS"
+                        
+                        // Second camera connected, cancel auto-zoom if it was pending
+                        mainHandler.removeCallbacks(autoZoomRunnable)
+                        
+                        // Return to split view if we were zoomed
+                        if (zoomedCameraId != null) {
+                            toggleZoom(zoomedCameraId!!)
+                        }
                     }
 
                     Log.d(TAG, "Camera opened: ${device.deviceName} (slot ${cameraMap.size})")
@@ -144,7 +276,7 @@ class DualCameraActivity : AppCompatActivity() {
                 isRequestingPermission = false
                 runOnUiThread {
                     Toast.makeText(this@DualCameraActivity, "USB permission denied", Toast.LENGTH_SHORT).show()
-                    val nextStatus = if (cameraMap.size == 0) statusLeft else statusRight
+                    val nextStatus = if (cameraMap.isEmpty()) statusLeft else statusRight
                     nextStatus.text = "Permission denied\nTap to try again..."
                     nextStatus.setOnClickListener {
                         device?.let { queuePermissionRequest(it) }
@@ -169,6 +301,10 @@ class DualCameraActivity : AppCompatActivity() {
                         statusRight.text = "Waiting for camera…"
                         labelRight.text = "Camera 2"
                     }
+                    // If the detached camera was zoomed, reset to split
+                    if (zoomedCameraId != null) {
+                        toggleZoom(zoomedCameraId!!)
+                    }
                 }
             }
 
@@ -179,7 +315,136 @@ class DualCameraActivity : AppCompatActivity() {
         
         checkAndRequestPermissions()
     }
+
+    private fun toggleZoom(viewId: Int) {
+        val cs = ConstraintSet()
+        cs.clone(rootLayout)
+
+        if (zoomedCameraId == viewId) {
+            // Reset to split view
+            zoomedCameraId = null
+            containerLeft.visibility = View.VISIBLE
+            containerRight.visibility = View.VISIBLE
+            divider.visibility = View.VISIBLE
+            
+            // Restore horizontal bottom controls
+            cs.clear(R.id.container_controls, ConstraintSet.TOP)
+            cs.connect(R.id.container_controls, ConstraintSet.BOTTOM, ConstraintSet.PARENT_ID, ConstraintSet.BOTTOM)
+            cs.connect(R.id.container_controls, ConstraintSet.START, ConstraintSet.PARENT_ID, ConstraintSet.START)
+            cs.connect(R.id.container_controls, ConstraintSet.END, ConstraintSet.PARENT_ID, ConstraintSet.END)
+            cs.constrainWidth(R.id.container_controls, ConstraintSet.MATCH_CONSTRAINT)
+            cs.constrainHeight(R.id.container_controls, ConstraintSet.WRAP_CONTENT)
+
+            cs.connect(R.id.container_cameras_parent, ConstraintSet.BOTTOM, R.id.container_controls, ConstraintSet.TOP)
+            cs.connect(R.id.container_cameras_parent, ConstraintSet.END, ConstraintSet.PARENT_ID, ConstraintSet.END)
+
+            containerControls.orientation = LinearLayout.HORIZONTAL
+            sectionMic.orientation = LinearLayout.VERTICAL
+            sectionSpeaker.orientation = LinearLayout.VERTICAL
+            
+            updateControlOrientation(false)
+        } else {
+            // Zoom into the selected camera
+            zoomedCameraId = viewId
+            if (viewId == R.id.texture_camera_left) {
+                containerLeft.visibility = View.VISIBLE
+                containerRight.visibility = View.GONE
+                divider.visibility = View.GONE
+            } else {
+                containerLeft.visibility = View.GONE
+                containerRight.visibility = View.VISIBLE
+                divider.visibility = View.GONE
+            }
+            
+            // Switch to vertical right controls
+            cs.clear(R.id.container_controls, ConstraintSet.START)
+            cs.clear(R.id.container_controls, ConstraintSet.BOTTOM)
+            cs.connect(R.id.container_controls, ConstraintSet.END, ConstraintSet.PARENT_ID, ConstraintSet.END)
+            cs.connect(R.id.container_controls, ConstraintSet.TOP, ConstraintSet.PARENT_ID, ConstraintSet.TOP)
+            cs.connect(R.id.container_controls, ConstraintSet.BOTTOM, ConstraintSet.PARENT_ID, ConstraintSet.BOTTOM)
+            cs.constrainWidth(R.id.container_controls, ConstraintSet.WRAP_CONTENT)
+            cs.constrainHeight(R.id.container_controls, ConstraintSet.MATCH_CONSTRAINT)
+
+            cs.clear(R.id.container_cameras_parent, ConstraintSet.BOTTOM)
+            cs.connect(R.id.container_cameras_parent, ConstraintSet.BOTTOM, ConstraintSet.PARENT_ID, ConstraintSet.BOTTOM)
+            cs.connect(R.id.container_cameras_parent, ConstraintSet.END, R.id.container_controls, ConstraintSet.START)
+
+            containerControls.orientation = LinearLayout.VERTICAL
+            sectionMic.orientation = LinearLayout.VERTICAL
+            sectionSpeaker.orientation = LinearLayout.VERTICAL
+            
+            updateControlOrientation(true)
+        }
+        cs.applyTo(rootLayout)
+        showOverlaysTemporarily()
+    }
     
+    private fun updateControlOrientation(isVertical: Boolean) {
+        val rotation = if (isVertical) 270f else 0f
+        
+        // When vertical, we need to swap width/height logic or just rotate
+        // Rotating 270 degrees makes them vertical
+        meterMic.rotation = rotation
+        meterSpeaker.rotation = rotation
+        seekMicGain.rotation = rotation
+        seekSpeakerGain.rotation = rotation
+        
+        // Adjust layout params for vertical mode if needed
+        // For simplicity, we just use rotation and standard wrap_content
+        val size = if (isVertical) 200 else ViewGroup.LayoutParams.MATCH_PARENT
+        
+        seekMicGain.layoutParams.width = if (isVertical) 300 else ViewGroup.LayoutParams.MATCH_PARENT
+        seekSpeakerGain.layoutParams.width = if (isVertical) 300 else ViewGroup.LayoutParams.MATCH_PARENT
+        meterMic.layoutParams.width = if (isVertical) 300 else ViewGroup.LayoutParams.MATCH_PARENT
+        meterSpeaker.layoutParams.width = if (isVertical) 300 else ViewGroup.LayoutParams.MATCH_PARENT
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        val keyName = when (keyCode) {
+            KeyEvent.KEYCODE_HEADSETHOOK -> "HEADSETHOOK (HANGUP/HOOK)"
+            KeyEvent.KEYCODE_VOLUME_UP -> "VOLUME_UP"
+            KeyEvent.KEYCODE_VOLUME_DOWN -> "VOLUME_DOWN"
+            KeyEvent.KEYCODE_VOLUME_MUTE -> "VOLUME_MUTE"
+            KeyEvent.KEYCODE_MUTE -> "MIC_MUTE"
+            KeyEvent.KEYCODE_ENDCALL -> "END_CALL (HANGUP)"
+            KeyEvent.KEYCODE_CALL -> "CALL_BUTTON"
+            KeyEvent.KEYCODE_MEDIA_PLAY -> "MEDIA_PLAY"
+            KeyEvent.KEYCODE_MEDIA_PAUSE -> "MEDIA_PAUSE"
+            KeyEvent.KEYCODE_MEDIA_NEXT -> "MEDIA_NEXT"
+            KeyEvent.KEYCODE_MEDIA_PREVIOUS -> "MEDIA_PREVIOUS"
+            KeyEvent.KEYCODE_CAMERA -> "CAMERA_BUTTON"
+            KeyEvent.KEYCODE_FOCUS -> "FOCUS_BUTTON"
+            else -> KeyEvent.keyCodeToString(keyCode)
+        }
+        
+        val eventInfo = "Button Event: $keyName"
+        Log.d(TAG, eventInfo)
+        
+        runOnUiThread {
+            // Show the event in the status text of the first camera slot
+            statusLeft.visibility = View.VISIBLE
+            statusLeft.text = eventInfo
+            showOverlaysTemporarily()
+            
+            // If it's a volume event, update the seeker to match system state
+            if (keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
+                mainHandler.postDelayed({
+                    seekSpeakerGain.progress = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+                }, 100)
+            }
+        }
+        
+        return super.onKeyDown(keyCode, event)
+    }
+    
+    private fun playTestChime() {
+        try {
+            toneGenerator?.startTone(ToneGenerator.TONE_PROP_BEEP, 100)
+        } catch (e: Exception) {
+            Log.e(TAG, "ToneGenerator error", e)
+        }
+    }
+
     private fun hideSystemUI() {
         val windowInsetsController = WindowCompat.getInsetsController(window, window.decorView)
         windowInsetsController.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
@@ -189,6 +454,8 @@ class DualCameraActivity : AppCompatActivity() {
     private fun showOverlaysTemporarily() {
         labelLeft.visibility = View.VISIBLE
         labelRight.visibility = View.VISIBLE
+        seekMicGain.visibility = View.VISIBLE
+        seekSpeakerGain.visibility = View.VISIBLE
         
         mainHandler.removeCallbacks(hideOverlayRunnable)
         mainHandler.postDelayed(hideOverlayRunnable, OVERLAY_TIMEOUT_MS)
@@ -197,6 +464,13 @@ class DualCameraActivity : AppCompatActivity() {
     private fun hideOverlays() {
         labelLeft.visibility = View.GONE
         labelRight.visibility = View.GONE
+        seekMicGain.visibility = View.GONE
+        seekSpeakerGain.visibility = View.GONE
+        
+        // Hide status if it's not the "Waiting" message
+        if (!statusLeft.text.contains("Waiting")) {
+            statusLeft.visibility = View.GONE
+        }
     }
     
     private fun queuePermissionRequest(device: UsbDevice) {
@@ -216,7 +490,7 @@ class DualCameraActivity : AppCompatActivity() {
         } else {
             isRequestingPermission = true
             runOnUiThread {
-                val nextStatus = if (cameraMap.size == 0) statusLeft else statusRight
+                val nextStatus = if (cameraMap.isEmpty()) statusLeft else statusRight
                 nextStatus.text = "Requesting permission for\n${device.deviceName}..."
             }
             try {
@@ -311,13 +585,15 @@ class DualCameraActivity : AppCompatActivity() {
                         for (i in 0 until read) {
                             sum += micBuffer[i] * micBuffer[i]
                         }
-                        val rms = Math.sqrt(sum / read)
-                        val level = (rms / 32767.0 * 100).toInt() * 4 // Scale up factor
+                        val rms = sqrt(sum / read)
+                        // Apply mic gain (0.0 to 4.0) and a scale factor to fill 0-100 range
+                        val level = (rms / 32767.0 * 100 * 4 * micGain).toInt()
                         runOnUiThread {
                             meterMic.progress = level.coerceIn(0, 100)
                         }
                     }
-                    Thread.sleep(50)
+                    // ~30 FPS (1000ms / 30 = 33.3ms)
+                    Thread.sleep(33)
                 }
             }.start()
         } catch (e: Exception) {
@@ -347,18 +623,20 @@ class DualCameraActivity : AppCompatActivity() {
                     waveform?.let {
                         var sum = 0.0
                         for (byte in it) {
-                            val amp = byte.toInt() - 128
+                            val amp = (byte.toInt() and 0xFF) - 128
                             sum += amp * amp
                         }
-                        val rms = Math.sqrt(sum / it.size)
-                        val level = (rms / 128.0 * 100).toInt() * 3 // Scale up factor
+                        val rms = sqrt(sum / it.size)
+                        // Scale level based on actual output signal
+                        // speakerGain here acts as a scaling factor for the visualizer meter
+                        val level = (rms / 128.0 * 100 * 3).toInt()
                         runOnUiThread {
                             meterSpeaker.progress = level.coerceIn(0, 100)
                         }
                     }
                 }
                 override fun onFftDataCapture(v: Visualizer?, fft: ByteArray?, samplingRate: Int) {}
-            }, Visualizer.getMaxCaptureRate() / 2, true, false)
+            }, 30000, true, false) // 30,000 mHz = 30 Hz (30 FPS)
             visualizer?.enabled = true
         } catch (e: Exception) {
             Log.e(TAG, "Visualizer error: check if another app is using it or if global mix is blocked", e)
@@ -386,6 +664,7 @@ class DualCameraActivity : AppCompatActivity() {
         isRequestingPermission = false
         
         mainHandler.removeCallbacks(hideOverlayRunnable)
+        mainHandler.removeCallbacks(autoZoomRunnable)
         stopMeters()
 
         statusLeft.visibility = View.VISIBLE
@@ -400,6 +679,7 @@ class DualCameraActivity : AppCompatActivity() {
         if (::cameraClient.isInitialized) {
             cameraClient.unRegister()
         }
+        toneGenerator?.release()
     }
 
     private fun nextFreeSurface(): AspectRatioTextureView? = when (cameraMap.size) {

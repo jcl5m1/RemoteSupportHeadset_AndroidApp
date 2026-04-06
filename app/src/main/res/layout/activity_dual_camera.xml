@@ -1,19 +1,25 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout
+<androidx.constraintlayout.widget.ConstraintLayout
     xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/root_layout"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:orientation="vertical"
     android:background="#000000">
 
     <LinearLayout
-        android:layout_width="match_parent"
+        android:id="@+id/container_cameras_parent"
+        android:layout_width="0dp"
         android:layout_height="0dp"
-        android:layout_weight="1"
-        android:orientation="horizontal">
+        android:orientation="horizontal"
+        app:layout_constraintBottom_toTopOf="@+id/container_controls"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent">
 
         <!-- Left camera feed -->
         <FrameLayout
+            android:id="@+id/container_camera_left"
             android:layout_width="0dp"
             android:layout_height="match_parent"
             android:layout_weight="1">
@@ -48,12 +54,14 @@
 
         <!-- Divider -->
         <View
+            android:id="@+id/divider_cameras"
             android:layout_width="2dp"
             android:layout_height="match_parent"
             android:background="#333333" />
 
         <!-- Right camera feed -->
         <FrameLayout
+            android:id="@+id/container_camera_right"
             android:layout_width="0dp"
             android:layout_height="match_parent"
             android:layout_weight="1">
@@ -87,55 +95,95 @@
         </FrameLayout>
     </LinearLayout>
 
-    <!-- VU Meters -->
+    <!-- VU Meters & Controls Container -->
     <LinearLayout
+        android:id="@+id/container_controls"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="horizontal"
         android:padding="8dp"
-        android:background="#222222">
+        android:background="#222222"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent">
 
+        <!-- Mic Section -->
         <LinearLayout
+            android:id="@+id/section_mic"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:orientation="horizontal"
-            android:gravity="center_vertical"
+            android:orientation="vertical"
             android:paddingEnd="8dp">
-            <TextView
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="MIC "
-                android:textColor="#FFF"
-                android:textStyle="bold" />
-            <ProgressBar
-                android:id="@+id/meter_mic"
-                style="?android:attr/progressBarStyleHorizontal"
+
+            <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:max="100" />
+                android:orientation="horizontal"
+                android:gravity="center_vertical">
+                <TextView
+                    android:id="@+id/title_mic"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="MIC "
+                    android:textColor="#FFF"
+                    android:textStyle="bold" />
+                <ProgressBar
+                    android:id="@+id/meter_mic"
+                    style="?android:attr/progressBarStyleHorizontal"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:max="100" />
+            </LinearLayout>
+
+            <SeekBar
+                android:id="@+id/seek_mic_gain"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="400"
+                android:progress="100"
+                android:thumbTint="#FF4081"
+                android:progressTint="#FF4081" />
         </LinearLayout>
 
+        <!-- Speaker Section -->
         <LinearLayout
+            android:id="@+id/section_speaker"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:orientation="horizontal"
-            android:gravity="center_vertical"
+            android:orientation="vertical"
             android:paddingStart="8dp">
-            <TextView
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="SPK "
-                android:textColor="#FFF"
-                android:textStyle="bold" />
-            <ProgressBar
-                android:id="@+id/meter_speaker"
-                style="?android:attr/progressBarStyleHorizontal"
+
+            <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:max="100" />
+                android:orientation="horizontal"
+                android:gravity="center_vertical">
+                <TextView
+                    android:id="@+id/title_speaker"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="SPK "
+                    android:textColor="#FFF"
+                    android:textStyle="bold" />
+                <ProgressBar
+                    android:id="@+id/meter_speaker"
+                    style="?android:attr/progressBarStyleHorizontal"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:max="100" />
+            </LinearLayout>
+
+            <SeekBar
+                android:id="@+id/seek_speaker_gain"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="200"
+                android:progress="100"
+                android:thumbTint="#3F51B5"
+                android:progressTint="#3F51B5" />
         </LinearLayout>
     </LinearLayout>
 
-</LinearLayout>
+</androidx.constraintlayout.widget.ConstraintLayout>
