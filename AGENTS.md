@@ -29,6 +29,7 @@ Key user-facing behavior:
 - **Primary third-party library**: `com.github.jiangdongguo.AndroidUSBCamera` (libausbc + libuvc, version 3.2.7) for UVC camera enumeration, permission handling, and preview.
 - **Computer vision**: AprilTag3 (16h5 family) through a custom JNI wrapper (`libapriltag_jni`).
 - **Firmware flashing**: `esp-serial-flasher` through a custom JNI wrapper (`libesp32flasher`).
+- **Runtime CDC commands**: `usb-serial-for-android` is used to open the ESP32-P4's CDC-ACM interface (when not already exclusively owned by the UVC stack) so the app can send exposure commands for the anti-banding servo.
 - **Audio APIs**:
   - `AudioRecord` for the microphone meter.
   - `Visualizer(0)` for the global speaker output meter.
@@ -65,9 +66,12 @@ RemoteSupportHeadset_AndroidApp/
 │       │   │   ├── AprilTagOverlayView.kt      # Overlay canvas for tag corners/IDs
 │       │   │   ├── AprilTagTracker.kt          # Temporal stability filter
 │       │   │   ├── MacbethColorCorrector.kt    # Chart layout + CCM solver/applier
-│       │   │   ├── Esp32Flasher.kt             # JNI wrapper for esp-serial-flasher
-│       │   │   ├── PinchZoomPanImageView.kt    # Zoom/pan image view for zoomed chart
-│       │   │   └── ReceiverExportWorkaroundContext.kt  # Android 14 receiver export workaround
+│   │   │   ├── Esp32Flasher.kt             # JNI wrapper for esp-serial-flasher
+│   │   │   ├── BandingAnalyzer.kt          # Vertical-slice banding metric from preview frames
+│   │   │   ├── AntiBandingTool.kt          # Stand-alone exposure-servo analysis tool (not auto-run)
+│   │   │   ├── CdcCommandHelper.kt         # USB CDC-ACM sender for runtime ESP32 commands
+│   │   │   ├── PinchZoomPanImageView.kt    # Zoom/pan image view for zoomed chart
+│   │   │   └── ReceiverExportWorkaroundContext.kt  # Android 14 receiver export workaround
 │       │   └── res/
 │       │       ├── layout/
 │       │       │   ├── activity_dual_camera.xml
@@ -97,7 +101,8 @@ The application runtime is contained mostly in `DualCameraActivity.kt`. The main
 6. **Macbeth colour correction** — when a supported chart is detected, `MacbethColorCorrector.correctFromAprilTags()` solves a 3×4 affine CCM; the user can toggle correction on/off.
 7. **Firmware flashing** — `startFirmwareFlashFlow()` finds `/Firmware/{bootloader.bin,partition-table.bin,usb_webcam.bin}` under `getExternalFilesDir(null)` and flashes them with `Esp32Flasher`.
 8. **Debug preview save** — `saveDebugPreview()` writes `win_raw.jpg`, `win_annotated.jpg`, and optionally `win_corrected.jpg` to `Pictures/DebugPreview`.
-9. **Utility helpers** — `nextFreeSurface`, `shouldRotateDevice`, `processNextPermission`, etc.
+9. **Anti-banding tool** — `AntiBandingTool` is a stand-alone analysis utility that grabs a vertical slice of the live preview, computes a banding metric with `BandingAnalyzer`, sweeps CSI exposure time via `CdcCommandHelper` to minimize intensity variation, captures the ESP32's own anti-banding exposure and detected flicker frequency, and emits a structured comparison line to `adb logcat` under the `AntiBandResult` tag.  Frames with mean intensity above ~92 % are rejected so the tool does not converge on an overexposed, clipped image.  It is no longer wired to the main UI or intent auto-start; instantiate and call `start()` from a debug/test path when needed.
+10. **Utility helpers** — `nextFreeSurface`, `shouldRotateDevice`, `processNextPermission`, etc.
 
 `MainActivity.kt` is currently dead code from an earlier iteration; the launcher intent in `AndroidManifest.xml` points directly to `DualCameraActivity`.
 
@@ -174,6 +179,8 @@ The app can reflash the ESP32-P4 over the high-speed USB-OTG CDC download port:
 3. The app reboots the ESP32 into ROM download mode, opens the download-mode USB device, and flashes each image to its offset via `libesp32flasher.so`.
 4. After a successful flash the ESP32 resets and re-enumerates as a UVC+CDC device.
 
+> The `AntiBandingTool` analysis utility is no longer wired to the main UI or to the `anti_band_now` intent.  Instantiate it from a debug/test path when you need to rerun the exposure sweep; results are still emitted to `adb logcat` under the `AntiBandResult` tag.
+
 ## Debug preview capture
 
 Whenever all four corner tags of a Macbeth chart are stable, the app saves a debug frame to:
@@ -233,7 +240,7 @@ There is no CI/CD pipeline, signing config, or app store deployment script in th
 - The app only runs on ARM devices with USB OTG host support. Emulators will not exercise camera or USB functionality meaningfully.
 - UVC camera orientation is corrected in the ESP32-P4 firmware by configuring the CSI OV5647 sensor's vertical-flip register (`sensor_set_flip(..., h_mirror=false, v_flip=true)`). No software flipping is performed on the ESP32 or the Android phone; the live UVC stream arrives upright.
 - The ISP Bayer order for the CSI live stream is `GRBG`. The OV5647 sensor's native CFA is `BGGR`; the sensor-level vertical flip maps that to `GRBG` for the ISP. The debayering stays in the ESP32-P4 ISP; the Android phone only receives YUV422/MJPEG.
-- The firmware's AE task snaps CSI exposure to integer multiples of the 120 Hz flicker period (`1/(2×60) s ≈ 8333 µs`) to reduce rolling banding under 60 Hz artificial lighting.
+- The firmware auto-detects the local mains frequency (50 Hz or 60 Hz) and snaps CSI exposure to integer multiples of the corresponding flicker half-period (10000 µs for 50 Hz mains, 8333 µs for 60 Hz mains) to reduce rolling banding.
 - A diagonal ISP colour-correction matrix (CCM) is applied in the ESP32-P4 ISP to neutralise the warm cast from the test lighting. The current gains are derived from the Macbeth chart white patch (R scaled to match G, B scaled to match G). The scene-mode AE target is also raised so the chart is properly exposed.
 - AprilTag detection runs directly on the upright preview bitmap. Do not re-introduce orientation permutations in the Android app.
 - `MainActivity` is not the launcher; do not add it to the `MAIN/LAUNCHER` intent filter unless you intentionally change the entry point.

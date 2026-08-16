@@ -14,6 +14,7 @@ Android companion app for the ESP32-P4 wearable webcam. It connects to one or tw
 - **Macbeth chart colour correction**: detects the same AprilTag-coded charts as `esp32-wearable/tools`, solves a 3×4 affine CCM, and applies it to the preview and saved debug frames.
 - **ESP32-P4 firmware flashing** over USB-OTG from binaries pushed to the device storage.
 - **Debug preview capture** (`win_raw.jpg`, `win_annotated.jpg`, `win_corrected.jpg`) saved when a complete chart is seen.
+- **Anti-banding analysis tool** (`AntiBandingTool`): stand-alone utility that sweeps CSI exposure time and reports the ESP32's auto anti-banding result versus the Android app's image-based optimum over ADB logcat.  Not wired to the normal UI.
 
 ## Requirements
 
@@ -56,6 +57,7 @@ The CMake build under `app/src/main/cpp/` produces two shared libraries:
 | `com.github.jiangdongguo.AndroidUSBCamera:libausbc:3.2.7` | UVC camera driver + multi-camera client |
 | `com.github.jiangdongguo.AndroidUSBCamera:libuvc:3.2.7` | Native UVC protocol implementation |
 | `androidx.exifinterface:exifinterface:1.3.7` | EXIF orientation handling |
+| `com.github.mik3y:usb-serial-for-android:3.8.0` | Runtime CDC commands to the ESP32 (analysis tools) |
 | AndroidX AppCompat, Core KTX, ConstraintLayout, Material | UI framework |
 
 ## Usage
@@ -98,6 +100,31 @@ adb shell am start -S -n com.example.remotesupportheadset/.DualCameraActivity --
 ```
 
 The app reboots the ESP32 into download mode and flashes each image to its correct offset.
+
+### Anti-banding analysis tool
+
+`AntiBandingTool` is a stand-alone analysis utility (not wired to the normal UI). Instantiate it from a debug/test path, point the camera at a uniform surface (e.g. a white wall) under the lighting you want to cancel, and call `start()`. The tool:
+
+1. Enables the ESP32 AE loop and reads its self-computed anti-banding exposure and detected flicker frequency via `status`.
+2. Disables AE and sweeps exposure time from 7 ms to 26 ms, measuring vertical-slice intensity variation for each.
+3. Fine-tunes around the best coarse value and sets the exposure that minimizes banding.
+4. Reports both results over ADB logcat:
+
+```bash
+adb logcat -d | grep AntiBandResult
+```
+
+Example output:
+
+```
+I AntiBandResult: FLICKER_HZ=50 ESP32_US=19999 ANDROID_US=19800 ANDROID_METRIC=0.060876 ANDROID_MEAN=147.9 DIFF_US=-199
+```
+
+- `FLICKER_HZ` is the mains frequency the firmware auto-detected.
+- `ESP32_US` is the firmware's snapped anti-banding exposure.
+- `ANDROID_US` is the exposure the image-based servo found.
+- `ANDROID_METRIC` is the normalized vertical-slice standard deviation at that exposure (lower is better).
+- `ANDROID_MEAN` is the average luminance at the chosen exposure; values near 255 indicate saturation.
 
 ## Notes
 

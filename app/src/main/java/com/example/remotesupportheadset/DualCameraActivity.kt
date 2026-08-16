@@ -186,6 +186,9 @@ class DualCameraActivity : AppCompatActivity() {
     private var colorCorrectionMatrix: FloatArray? = null
     private var colorCorrectionEnabled = false
 
+    // Runtime CDC command helper (used by analysis tools and still-capture helpers).
+    private val cdcCommandHelper by lazy { CdcCommandHelper(this) }
+
     // Valid AprilTag IDs for the corner markers of the Macbeth chart layouts
     // (DICT_APRILTAG_16H5, chart sizes 3x3 through 4x6).
     private val MACBETH_CORNER_IDS = setOf(
@@ -469,6 +472,7 @@ class DualCameraActivity : AppCompatActivity() {
             Log.d(TAG, "EXTRA_FLASH_NOW requested, starting flash flow without confirmation")
             startFirmwareFlashFlow(skipConfirmation = true)
         }
+
     }
 
     private fun initCameraClient() {
@@ -522,6 +526,7 @@ class DualCameraActivity : AppCompatActivity() {
                                 lastFrameTime = 0L
                                 Thread { populateDiagnosticsCache(device, ctrlBlock) }.start()
                                 runOnUiThread { applyPreviewRotation() }
+
                             } else if (code == ICameraStateCallBack.State.ERROR || code == ICameraStateCallBack.State.CLOSED) {
                                 Log.e(TAG, "Camera state error/closed: $code, msg=$msg")
                                 recoverCamera()
@@ -2888,4 +2893,5 @@ class DualCameraActivity : AppCompatActivity() {
         spkLevelMeter.progress = percent
         spkLevelLabel.text = "SPK: %.1f dB".format(db)
     }
+
 }
