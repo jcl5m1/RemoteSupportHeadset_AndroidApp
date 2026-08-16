@@ -1,0 +1,3 @@
+[submodule "app/src/main/cpp/esp-serial-flasher"]
+	path = app/src/main/cpp/esp-serial-flasher
+	url = https://github.com/espressif/esp-serial-flasher.git
