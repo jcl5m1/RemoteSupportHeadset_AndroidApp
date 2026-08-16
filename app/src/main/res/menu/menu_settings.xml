@@ -4,6 +4,6 @@
         android:id="@+id/action_diagnostics"
         android:title="Show diagnostics" />
     <item
-        android:id="@+id/action_firmware"
-        android:title="Firmware" />
+        android:id="@+id/action_update_firmware"
+        android:title="Update firmware" />
 </menu>

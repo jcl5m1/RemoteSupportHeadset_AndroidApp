@@ -16,7 +16,7 @@ Key user-facing behavior:
 - Labels, sliders, and the settings button auto-hide after 5 seconds.
 - Displays live MIC and SPK level meters at the bottom.
 - Provides a single **Record** button that toggles video recording on/off.
-- Provides a **Settings** popup with **Firmware** (reflash ESP32-P4) and **Show diagnostics** options.
+- Provides a **Settings** popup with **Update firmware** (download from a URL and reflash ESP32-P4) and **Show diagnostics** options.
 - Runs AprilTag detection on the live preview, overlays detected tags, and can compute a colour-correction matrix from a Macbeth chart.
 - Saves debug preview frames when a complete Macbeth chart is detected.
 
@@ -173,7 +173,7 @@ The app can reflash the ESP32-P4 over the high-speed USB-OTG CDC download port:
    - `bootloader.bin`
    - `partition-table.bin`
    - `usb_webcam.bin`
-2. Open **Settings → Firmware** in the app, or launch the activity with `--ez flash_now true` to skip the confirmation dialog:
+2. Open **Settings → Update firmware** in the app, or launch the activity with `--ez flash_now true` to skip the confirmation dialog:
    ```bash
    adb shell am start -S -n com.example.remotesupportheadset/.DualCameraActivity --ez flash_now true
    ```

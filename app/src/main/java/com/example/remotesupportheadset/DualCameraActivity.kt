@@ -45,6 +45,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.widget.Button
 import androidx.appcompat.widget.PopupMenu
+import android.widget.EditText
 import android.widget.ImageView
 import android.widget.ProgressBar
 import android.widget.ScrollView
@@ -69,6 +70,9 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.InputStream
+import java.net.HttpURLConnection
+import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -1010,6 +1014,128 @@ class DualCameraActivity : AppCompatActivity() {
     // ESP32-P4 firmware flashing over USB-OTG
     // -------------------------------------------------------------------------
 
+    private fun promptForFirmwareUrl() {
+        val input = EditText(this).apply {
+            hint = "https://example.com/firmware/"
+            setSingleLine(true)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Update firmware")
+            .setMessage("Enter the base URL containing bootloader.bin, partition-table.bin, and usb_webcam.bin")
+            .setView(input)
+            .setPositiveButton("Download") { _, _ ->
+                val url = input.text.toString().trim()
+                if (url.isNotEmpty()) {
+                    downloadFirmwareFromUrl(url)
+                } else {
+                    Toast.makeText(this, "URL is required", Toast.LENGTH_SHORT).show()
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun downloadFirmwareFromUrl(baseUrl: String) {
+        val firmwareDir = File(getExternalFilesDir(null), "Firmware").apply {
+            mkdirs()
+        }
+        val files = listOf(
+            "bootloader.bin" to File(firmwareDir, "bootloader.bin"),
+            "partition-table.bin" to File(firmwareDir, "partition-table.bin"),
+            "usb_webcam.bin" to File(firmwareDir, "usb_webcam.bin")
+        )
+
+        val progressView = layoutInflater.inflate(R.layout.dialog_flash_progress, null)
+        val titleView = progressView.findViewById<TextView>(R.id.flash_progress_title)
+        val messageView = progressView.findViewById<TextView>(R.id.flash_progress_message)
+        val progressBar = progressView.findViewById<ProgressBar>(R.id.flash_progress_bar)
+        val bytesView = progressView.findViewById<TextView>(R.id.flash_progress_bytes)
+
+        titleView.text = "Downloading firmware"
+        messageView.text = "Starting..."
+        progressBar.progress = 0
+        bytesView.text = ""
+
+        val dialog = AlertDialog.Builder(this)
+            .setView(progressView)
+            .setCancelable(false)
+            .show()
+
+        Thread {
+            var successCount = 0
+            var failureMessage: String? = null
+            try {
+                for ((index, pair) in files.withIndex()) {
+                    val (name, dest) = pair
+                    if (!isFinishing) {
+                        runOnUiThread {
+                            messageView.text = "Downloading $name..."
+                            progressBar.progress = (index * 1000) / files.size
+                        }
+                    }
+                    val url = baseUrl.trimEnd('/') + "/" + name
+                    val result = downloadFile(url, dest)
+                    if (result) {
+                        successCount++
+                    } else {
+                        failureMessage = "Failed to download $name"
+                        break
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Firmware download failed", e)
+                failureMessage = e.message ?: "Download failed"
+            } finally {
+                if (!isFinishing) {
+                    runOnUiThread {
+                        dialog.dismiss()
+                        when {
+                            failureMessage != null -> {
+                                Toast.makeText(this, failureMessage, Toast.LENGTH_LONG).show()
+                            }
+                            successCount == files.size -> {
+                                Toast.makeText(this, "Firmware downloaded; starting flash...", Toast.LENGTH_SHORT).show()
+                                startFirmwareFlashFlow()
+                            }
+                        }
+                    }
+                }
+            }
+        }.apply { name = "FirmwareDownloadThread"; start() }
+    }
+
+    private fun downloadFile(urlString: String, dest: File): Boolean {
+        var connection: HttpURLConnection? = null
+        var input: InputStream? = null
+        var output: FileOutputStream? = null
+        return try {
+            val url = URL(urlString)
+            connection = url.openConnection() as HttpURLConnection
+            connection.requestMethod = "GET"
+            connection.connectTimeout = 30000
+            connection.readTimeout = 30000
+            connection.setRequestProperty("Accept", "*/*")
+            val responseCode = connection.responseCode
+            if (responseCode != HttpURLConnection.HTTP_OK) {
+                Log.w(TAG, "Download failed for $urlString: HTTP $responseCode")
+                return false
+            }
+            input = connection.inputStream
+            output = FileOutputStream(dest)
+            input.copyTo(output)
+            output.flush()
+            Log.i(TAG, "Downloaded $urlString -> ${dest.absolutePath} (${dest.length()} bytes)")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Download error for $urlString", e)
+            false
+        } finally {
+            input?.close()
+            output?.close()
+            connection?.disconnect()
+        }
+    }
+
     private fun startFirmwareFlashFlow(skipConfirmation: Boolean = false) {
         Log.d(TAG, "startFirmwareFlashFlow called, flashInProgress=$flashInProgress, skipConfirmation=$skipConfirmation")
         if (flashInProgress) {
@@ -1574,9 +1700,9 @@ class DualCameraActivity : AppCompatActivity() {
                 if (diagnosticsVisible) "Hide diagnostics" else "Show diagnostics"
             setOnMenuItemClickListener { item ->
                 when (item.itemId) {
-                    R.id.action_firmware -> {
-                        Log.d(TAG, "Settings: firmware selected")
-                        startFirmwareFlashFlow()
+                    R.id.action_update_firmware -> {
+                        Log.d(TAG, "Settings: update firmware selected")
+                        promptForFirmwareUrl()
                         true
                     }
                     R.id.action_diagnostics -> {

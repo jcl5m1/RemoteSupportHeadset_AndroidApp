@@ -68,7 +68,7 @@ The CMake build under `app/src/main/cpp/` produces two shared libraries:
 4. Tap the screen to show/hide labels and controls.
 5. The **MIC** and **SPK** meters at the bottom show live audio levels.
 6. The **Record** button starts video recording; tap it again to stop.
-7. The **Settings** button opens a menu with **Firmware** (reflash the ESP32-P4) and **Show diagnostics**.
+7. The **Settings** button opens a menu with **Update firmware** and **Show diagnostics**.
 
 ### AprilTag / Macbeth chart detection
 
@@ -80,7 +80,27 @@ Point the camera at one of the supported AprilTag-coded Macbeth charts (layouts 
 
 The colour-correction matrix is applied automatically to the live preview once it has been computed.
 
-### ESP32-P4 firmware flashing
+### ESP32-P4 firmware update
+
+The app can download firmware directly from a URL or use files already pushed to the phone.
+
+#### Update from URL
+
+Open **Settings → Update firmware** and enter the base URL that contains the three binaries:
+
+```
+https://example.com/firmware/
+```
+
+The app downloads:
+
+- `bootloader.bin`
+- `partition-table.bin`
+- `usb_webcam.bin`
+
+into `/sdcard/Android/data/com.example.remotesupportheadset/files/Firmware/` and then starts the flash flow automatically.
+
+#### Update from local files
 
 Push the three firmware binaries from the sibling `esp32-wearable/esp32-p4-wearable/build/` directory to the phone:
 
@@ -93,7 +113,7 @@ adb push build/usb_webcam.bin \
          /sdcard/Android/data/com.example.remotesupportheadset/files/Firmware/usb_webcam.bin
 ```
 
-Then either open **Settings → Firmware** in the app, or start flashing from `adb`:
+Then open **Settings → Update firmware** in the app, or start flashing from `adb`:
 
 ```bash
 adb shell am start -S -n com.example.remotesupportheadset/.DualCameraActivity --ez flash_now true
