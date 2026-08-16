@@ -78,6 +78,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantLock
+import java.util.zip.ZipInputStream
 
 class DualCameraActivity : AppCompatActivity() {
 
@@ -105,6 +106,8 @@ class DualCameraActivity : AppCompatActivity() {
 
         /** Intent extra that starts the ESP32 flash flow without showing the confirmation dialog. */
         const val EXTRA_FLASH_NOW = "flash_now"
+        /** Intent extra that provides a firmware .zip URL to download before flashing. */
+        const val EXTRA_FIRMWARE_URL = "firmware_url"
     }
 
     private lateinit var textureCamera: AspectRatioTextureView
@@ -414,7 +417,12 @@ class DualCameraActivity : AppCompatActivity() {
 
         // Allow an external caller (e.g. adb from a MacBook) to start flashing
         // immediately without tapping the on-screen Flash button or confirming.
-        if (intent?.getBooleanExtra(EXTRA_FLASH_NOW, false) == true) {
+        val initialFirmwareUrl = intent?.getStringExtra(EXTRA_FIRMWARE_URL)
+        if (initialFirmwareUrl != null) {
+            val skipConfirmation = intent.getBooleanExtra(EXTRA_FLASH_NOW, false)
+            Log.d(TAG, "EXTRA_FIRMWARE_URL=$initialFirmwareUrl, flash_now=$skipConfirmation")
+            downloadFirmwareFromUrl(initialFirmwareUrl, skipConfirmation)
+        } else if (intent?.getBooleanExtra(EXTRA_FLASH_NOW, false) == true) {
             Log.d(TAG, "EXTRA_FLASH_NOW requested, starting flash flow without confirmation")
             startFirmwareFlashFlow(skipConfirmation = true)
         }
@@ -1016,17 +1024,17 @@ class DualCameraActivity : AppCompatActivity() {
 
     private fun promptForFirmwareUrl() {
         val input = EditText(this).apply {
-            hint = "https://example.com/firmware/"
+            hint = "https://example.com/firmware.zip"
             setSingleLine(true)
         }
         AlertDialog.Builder(this)
             .setTitle("Update firmware")
-            .setMessage("Enter the base URL containing bootloader.bin, partition-table.bin, and usb_webcam.bin")
+            .setMessage("Enter the URL of a firmware .zip file containing bootloader.bin, partition-table.bin, and usb_webcam.bin")
             .setView(input)
             .setPositiveButton("Download") { _, _ ->
                 val url = input.text.toString().trim()
                 if (url.isNotEmpty()) {
-                    downloadFirmwareFromUrl(url)
+                    downloadFirmwareFromUrl(url, skipConfirmation = false)
                 } else {
                     Toast.makeText(this, "URL is required", Toast.LENGTH_SHORT).show()
                 }
@@ -1035,11 +1043,11 @@ class DualCameraActivity : AppCompatActivity() {
             .show()
     }
 
-    private fun downloadFirmwareFromUrl(baseUrl: String) {
+    private fun downloadFirmwareFromUrl(zipUrl: String, skipConfirmation: Boolean) {
         val firmwareDir = File(getExternalFilesDir(null), "Firmware").apply {
             mkdirs()
         }
-        val files = listOf(
+        val expectedFiles = listOf(
             "bootloader.bin" to File(firmwareDir, "bootloader.bin"),
             "partition-table.bin" to File(firmwareDir, "partition-table.bin"),
             "usb_webcam.bin" to File(firmwareDir, "usb_webcam.bin")
@@ -1062,49 +1070,99 @@ class DualCameraActivity : AppCompatActivity() {
             .show()
 
         Thread {
-            var successCount = 0
             var failureMessage: String? = null
             try {
-                for ((index, pair) in files.withIndex()) {
-                    val (name, dest) = pair
-                    if (!isFinishing) {
+                if (!isFinishing) {
+                    runOnUiThread { messageView.text = "Downloading firmware.zip..." }
+                }
+
+                val zipFile = File(cacheDir, "firmware_download.zip")
+                val downloaded = downloadFile(zipUrl, zipFile) { bytesRead, totalBytes ->
+                    if (!isFinishing && totalBytes > 0) {
                         runOnUiThread {
-                            messageView.text = "Downloading $name..."
-                            progressBar.progress = (index * 1000) / files.size
+                            val pct = ((bytesRead * 1000L) / totalBytes).toInt()
+                            progressBar.progress = pct.coerceIn(0, 1000)
+                            bytesView.text = "$bytesRead / $totalBytes bytes"
                         }
                     }
-                    val url = baseUrl.trimEnd('/') + "/" + name
-                    val result = downloadFile(url, dest)
-                    if (result) {
-                        successCount++
-                    } else {
-                        failureMessage = "Failed to download $name"
-                        break
+                }
+                if (!downloaded) {
+                    failureMessage = "Failed to download firmware.zip"
+                    return@Thread
+                }
+
+                if (!isFinishing) {
+                    runOnUiThread {
+                        messageView.text = "Extracting firmware..."
+                        progressBar.progress = 0
+                    }
+                }
+                extractFirmwareZip(zipFile, expectedFiles) { entryIndex, entryCount ->
+                    if (!isFinishing) {
+                        runOnUiThread {
+                            progressBar.progress = ((entryIndex * 1000L) / entryCount).toInt()
+                        }
+                    }
+                }
+
+                if (!isFinishing) {
+                    runOnUiThread {
+                        dialog.dismiss()
+                        Toast.makeText(this, "Firmware downloaded; starting flash...", Toast.LENGTH_SHORT).show()
+                        startFirmwareFlashFlow(skipConfirmation = skipConfirmation)
                     }
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Firmware download failed", e)
                 failureMessage = e.message ?: "Download failed"
             } finally {
-                if (!isFinishing) {
+                if (failureMessage != null && !isFinishing) {
                     runOnUiThread {
                         dialog.dismiss()
-                        when {
-                            failureMessage != null -> {
-                                Toast.makeText(this, failureMessage, Toast.LENGTH_LONG).show()
-                            }
-                            successCount == files.size -> {
-                                Toast.makeText(this, "Firmware downloaded; starting flash...", Toast.LENGTH_SHORT).show()
-                                startFirmwareFlashFlow()
-                            }
-                        }
+                        Toast.makeText(this, failureMessage, Toast.LENGTH_LONG).show()
                     }
                 }
             }
         }.apply { name = "FirmwareDownloadThread"; start() }
     }
 
-    private fun downloadFile(urlString: String, dest: File): Boolean {
+    private fun extractFirmwareZip(
+        zipFile: File,
+        expectedFiles: List<Pair<String, File>>,
+        progress: ((Int, Int) -> Unit)? = null
+    ) {
+        val expectedNames = expectedFiles.map { it.first }.toSet()
+        val destByName = expectedFiles.associate { it.first to it.second }
+        var extractedCount = 0
+        ZipInputStream(FileInputStream(zipFile).buffered()).use { zis ->
+            var entry = zis.nextEntry
+            while (entry != null) {
+                val name = entry.name
+                if (!entry.isDirectory && expectedNames.contains(name)) {
+                    val dest = destByName[name] ?: continue
+                    FileOutputStream(dest).use { output ->
+                        zis.copyTo(output)
+                    }
+                    extractedCount++
+                    Log.i(TAG, "Extracted $name -> ${dest.absolutePath} (${dest.length()} bytes)")
+                }
+                zis.closeEntry()
+                entry = zis.nextEntry
+                progress?.invoke(extractedCount, expectedFiles.size)
+            }
+        }
+        if (extractedCount != expectedFiles.size) {
+            val found = expectedFiles.filter { it.second.exists() }.map { it.first }
+            val missing = expectedFiles.map { it.first } - found.toSet()
+            throw IllegalStateException("Firmware zip missing files: ${missing.joinToString()}")
+        }
+    }
+
+    private fun downloadFile(
+        urlString: String,
+        dest: File,
+        progress: ((Long, Long) -> Unit)? = null
+    ): Boolean {
         var connection: HttpURLConnection? = null
         var input: InputStream? = null
         var output: FileOutputStream? = null
@@ -1120,9 +1178,17 @@ class DualCameraActivity : AppCompatActivity() {
                 Log.w(TAG, "Download failed for $urlString: HTTP $responseCode")
                 return false
             }
+            val totalBytes = connection.contentLength.toLong().coerceAtLeast(0L)
             input = connection.inputStream
             output = FileOutputStream(dest)
-            input.copyTo(output)
+            val buffer = ByteArray(8192)
+            var bytesRead = 0L
+            var count: Int
+            while (input.read(buffer).also { count = it } != -1) {
+                output.write(buffer, 0, count)
+                bytesRead += count
+                progress?.invoke(bytesRead, totalBytes)
+            }
             output.flush()
             Log.i(TAG, "Downloaded $urlString -> ${dest.absolutePath} (${dest.length()} bytes)")
             true
@@ -2730,7 +2796,12 @@ class DualCameraActivity : AppCompatActivity() {
 
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
-        if (intent?.getBooleanExtra(EXTRA_FLASH_NOW, false) == true) {
+        val firmwareUrl = intent?.getStringExtra(EXTRA_FIRMWARE_URL)
+        if (firmwareUrl != null) {
+            val skipConfirmation = intent.getBooleanExtra(EXTRA_FLASH_NOW, false)
+            Log.d(TAG, "onNewIntent: EXTRA_FIRMWARE_URL=$firmwareUrl, flash_now=$skipConfirmation")
+            downloadFirmwareFromUrl(firmwareUrl, skipConfirmation)
+        } else if (intent?.getBooleanExtra(EXTRA_FLASH_NOW, false) == true) {
             Log.d(TAG, "onNewIntent: EXTRA_FLASH_NOW requested, starting flash flow without confirmation")
             startFirmwareFlashFlow(skipConfirmation = true)
         }

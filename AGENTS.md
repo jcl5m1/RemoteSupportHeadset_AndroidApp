@@ -167,18 +167,23 @@ You can also open the project in Android Studio and let it sync Gradle automatic
 
 ## ESP32-P4 firmware flashing
 
-The app can reflash the ESP32-P4 over the high-speed USB-OTG CDC download port:
+The app can reflash the ESP32-P4 over the high-speed USB-OTG CDC download port. The normal path downloads a single firmware `.zip` from a URL, extracts the three binaries, and flashes them:
 
-1. Push the three firmware binaries to `/sdcard/Android/data/com.example.remotesupportheadset/files/Firmware/`:
-   - `bootloader.bin`
-   - `partition-table.bin`
-   - `usb_webcam.bin`
-2. Open **Settings → Update firmware** in the app, or launch the activity with `--ez flash_now true` to skip the confirmation dialog:
+1. Build the firmware in the sibling `esp32-wearable/esp32-p4-wearable/` project and package it:
    ```bash
-   adb shell am start -S -n com.example.remotesupportheadset/.DualCameraActivity --ez flash_now true
+   python3 serve_firmware.py --port 8765
    ```
-3. The app reboots the ESP32 into ROM download mode, opens the download-mode USB device, and flashes each image to its offset via `libesp32flasher.so`.
+   This writes `build/firmware.zip` containing `bootloader.bin`, `partition-table.bin`, and `usb_webcam.bin`, and prints a reachable URL such as `http://192.168.1.123:8765/firmware.zip`.
+2. Open **Settings → Update firmware** in the app and paste the `.zip` URL, or launch the activity with the URL and `--ez flash_now true` to skip the confirmation dialog:
+   ```bash
+   adb shell am start -S -n com.example.remotesupportheadset/.DualCameraActivity \
+       --ez flash_now true \
+       --es firmware_url http://<host-ip>:8765/firmware.zip
+   ```
+3. The app downloads the zip to a temporary cache file, extracts the three binaries into `/sdcard/Android/data/com.example.remotesupportheadset/files/Firmware/`, reboots the ESP32 into ROM download mode, and flashes each image to its offset via `libesp32flasher.so`.
 4. After a successful flash the ESP32 resets and re-enumerates as a UVC+CDC device.
+
+If the binaries are already on the phone, `--ez flash_now true` alone starts flashing from the existing files.
 
 > The `AntiBandingTool` analysis utility is no longer wired to the main UI or to the `anti_band_now` intent.  Instantiate it from a debug/test path when you need to rerun the exposure sweep; results are still emitted to `adb logcat` under the `AntiBandResult` tag.
 

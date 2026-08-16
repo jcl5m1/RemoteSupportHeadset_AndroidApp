@@ -82,38 +82,35 @@ The colour-correction matrix is applied automatically to the live preview once i
 
 ### ESP32-P4 firmware update
 
-The app can download firmware directly from a URL or use files already pushed to the phone.
+The app downloads a single firmware `.zip` file, extracts the three binaries, and flashes them over USB-OTG.
 
 #### Update from URL
 
-Open **Settings → Update firmware** and enter the base URL that contains the three binaries:
-
-```
-https://example.com/firmware/
-```
-
-The app downloads:
+Open **Settings → Update firmware** and enter the URL of a `.zip` file that contains:
 
 - `bootloader.bin`
 - `partition-table.bin`
 - `usb_webcam.bin`
 
-into `/sdcard/Android/data/com.example.remotesupportheadset/files/Firmware/` and then starts the flash flow automatically.
+The app downloads the zip to a temporary cache file, extracts the three binaries into `/sdcard/Android/data/com.example.remotesupportheadset/files/Firmware/`, and then starts the flash flow automatically.
+
+For local development, build the firmware and run the helper in the sibling `esp32-wearable/esp32-p4-wearable/` directory:
+
+```bash
+python3 serve_firmware.py --port 8765
+```
+
+This creates `build/firmware.zip` and prints a reachable URL such as `http://192.168.1.123:8765/firmware.zip`. Paste that URL into the app, or send it directly to the phone over ADB Wi-Fi:
+
+```bash
+adb shell am start -S -n com.example.remotesupportheadset/.DualCameraActivity \
+    --ez flash_now true \
+    --es firmware_url http://<host-ip>:8765/firmware.zip
+```
 
 #### Update from local files
 
-Push the three firmware binaries from the sibling `esp32-wearable/esp32-p4-wearable/build/` directory to the phone:
-
-```bash
-adb push build/bootloader/bootloader.bin \
-         /sdcard/Android/data/com.example.remotesupportheadset/files/Firmware/bootloader.bin
-adb push build/partition_table/partition-table.bin \
-         /sdcard/Android/data/com.example.remotesupportheadset/files/Firmware/partition-table.bin
-adb push build/usb_webcam.bin \
-         /sdcard/Android/data/com.example.remotesupportheadset/files/Firmware/usb_webcam.bin
-```
-
-Then open **Settings → Update firmware** in the app, or start flashing from `adb`:
+If the binaries are already on the phone in `/sdcard/Android/data/com.example.remotesupportheadset/files/Firmware/`, open **Settings → Update firmware** and enter any URL, or start flashing from `adb`:
 
 ```bash
 adb shell am start -S -n com.example.remotesupportheadset/.DualCameraActivity --ez flash_now true
