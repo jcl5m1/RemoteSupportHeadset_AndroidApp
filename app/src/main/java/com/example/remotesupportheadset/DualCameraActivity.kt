@@ -44,6 +44,7 @@ import androidx.exifinterface.media.ExifInterface
 import android.view.MotionEvent
 import android.view.View
 import android.widget.Button
+import androidx.appcompat.widget.PopupMenu
 import android.widget.ImageView
 import android.widget.ProgressBar
 import android.widget.ScrollView
@@ -109,10 +110,8 @@ class DualCameraActivity : AppCompatActivity() {
     private lateinit var tapHint: TextView
     private lateinit var diagnosticsPanel: ScrollView
     private lateinit var diagnosticsText: TextView
-    private lateinit var diagnosticsToggle: Button
+    private lateinit var settingsButton: Button
     private lateinit var recordToggle: Button
-    private lateinit var recordStop: Button
-    private lateinit var flashFirmwareButton: Button
     private lateinit var thumbnailLastCapture: ImageView
     private lateinit var thumbnailLabel: TextView
     private lateinit var zoomOverlay: View
@@ -362,10 +361,8 @@ class DualCameraActivity : AppCompatActivity() {
         tapHint = findViewById(R.id.tap_hint)
         diagnosticsPanel = findViewById(R.id.diagnostics_panel)
         diagnosticsText = findViewById(R.id.diagnostics_text)
-        diagnosticsToggle = findViewById(R.id.diagnostics_toggle)
+        settingsButton = findViewById(R.id.settings_button)
         recordToggle = findViewById(R.id.record_toggle)
-        recordStop = findViewById(R.id.record_stop)
-        flashFirmwareButton = findViewById(R.id.flash_firmware)
         thumbnailLastCapture = findViewById(R.id.thumbnail_last_capture)
         thumbnailLabel = findViewById(R.id.thumbnail_label)
         zoomOverlay = findViewById(R.id.zoom_overlay)
@@ -387,31 +384,15 @@ class DualCameraActivity : AppCompatActivity() {
             true
         }
 
-        diagnosticsToggle.setOnClickListener {
-            Log.d(TAG, "Diagnostics toggle clicked")
-            diagnosticsVisible = !diagnosticsVisible
-            diagnosticsPanel.visibility = if (diagnosticsVisible) View.VISIBLE else View.GONE
-            diagnosticsToggle.text = if (diagnosticsVisible) "Hide" else "Diag"
-            if (diagnosticsVisible) {
-                updateDiagnostics()
-            }
+        settingsButton.setOnClickListener {
+            showSettingsMenu()
         }
 
         recordToggle.setOnClickListener {
             when (recordingState) {
                 RecordingState.IDLE -> startRecording()
-                RecordingState.RECORDING -> pauseRecording()
-                RecordingState.PAUSED -> resumeRecording()
+                else -> stopRecording()
             }
-        }
-
-        recordStop.setOnClickListener {
-            stopRecording()
-        }
-
-        flashFirmwareButton.setOnClickListener {
-            Log.d(TAG, "Flash firmware button clicked")
-            startFirmwareFlashFlow()
         }
 
         thumbnailLastCapture.setOnClickListener {
@@ -1578,21 +1559,37 @@ class DualCameraActivity : AppCompatActivity() {
             RecordingState.IDLE -> {
                 recordToggle.text = "Record"
                 recordToggle.backgroundTintList = android.content.res.ColorStateList.valueOf(0xFFAA3333.toInt())
-                recordStop.isEnabled = false
-                recordStop.backgroundTintList = android.content.res.ColorStateList.valueOf(0xFF444444.toInt())
             }
-            RecordingState.RECORDING -> {
-                recordToggle.text = "Pause"
-                recordToggle.backgroundTintList = android.content.res.ColorStateList.valueOf(0xFFCC8800.toInt())
-                recordStop.isEnabled = true
-                recordStop.backgroundTintList = android.content.res.ColorStateList.valueOf(0xFFAA3333.toInt())
+            else -> {
+                recordToggle.text = "Stop"
+                recordToggle.backgroundTintList = android.content.res.ColorStateList.valueOf(0xFFAA3333.toInt())
             }
-            RecordingState.PAUSED -> {
-                recordToggle.text = "Resume"
-                recordToggle.backgroundTintList = android.content.res.ColorStateList.valueOf(0xFF33AA33.toInt())
-                recordStop.isEnabled = true
-                recordStop.backgroundTintList = android.content.res.ColorStateList.valueOf(0xFFAA3333.toInt())
+        }
+    }
+
+    private fun showSettingsMenu() {
+        PopupMenu(this, settingsButton).apply {
+            menuInflater.inflate(R.menu.menu_settings, menu)
+            menu.findItem(R.id.action_diagnostics)?.title =
+                if (diagnosticsVisible) "Hide diagnostics" else "Show diagnostics"
+            setOnMenuItemClickListener { item ->
+                when (item.itemId) {
+                    R.id.action_firmware -> {
+                        Log.d(TAG, "Settings: firmware selected")
+                        startFirmwareFlashFlow()
+                        true
+                    }
+                    R.id.action_diagnostics -> {
+                        Log.d(TAG, "Settings: diagnostics selected")
+                        diagnosticsVisible = !diagnosticsVisible
+                        diagnosticsPanel.visibility = if (diagnosticsVisible) View.VISIBLE else View.GONE
+                        if (diagnosticsVisible) updateDiagnostics()
+                        true
+                    }
+                    else -> false
+                }
             }
+            show()
         }
     }
 

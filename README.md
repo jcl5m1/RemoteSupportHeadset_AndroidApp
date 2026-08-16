@@ -67,7 +67,8 @@ The CMake build under `app/src/main/cpp/` produces two shared libraries:
 3. Plug in a second camera if desired — it appears in the right slot.
 4. Tap the screen to show/hide labels and controls.
 5. The **MIC** and **SPK** meters at the bottom show live audio levels.
-6. The **Firmware** button reflashes the ESP32-P4 from binaries placed in the device's `Firmware/` directory (see below).
+6. The **Record** button starts video recording; tap it again to stop.
+7. The **Settings** button opens a menu with **Firmware** (reflash the ESP32-P4) and **Show diagnostics**.
 
 ### AprilTag / Macbeth chart detection
 
@@ -92,7 +93,7 @@ adb push build/usb_webcam.bin \
          /sdcard/Android/data/com.example.remotesupportheadset/files/Firmware/usb_webcam.bin
 ```
 
-Then either tap **Firmware** in the app, or start flashing from `adb`:
+Then either open **Settings → Firmware** in the app, or start flashing from `adb`:
 
 ```bash
 adb shell am start -S -n com.example.remotesupportheadset/.DualCameraActivity --ez flash_now true

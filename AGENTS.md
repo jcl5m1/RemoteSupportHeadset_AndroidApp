@@ -13,10 +13,11 @@ Key user-facing behavior:
 - Assigns the first camera to the left slot and the second camera to the right slot.
 - If only one camera is connected, the view automatically zooms to that camera after a short delay.
 - Double-tap a camera feed to toggle zoom; single-tap anywhere to temporarily show labels and controls.
-- Labels, sliders, and the firmware button auto-hide after 5 seconds.
+- Labels, sliders, and the settings button auto-hide after 5 seconds.
 - Displays live MIC and SPK level meters at the bottom.
+- Provides a single **Record** button that toggles video recording on/off.
+- Provides a **Settings** popup with **Firmware** (reflash ESP32-P4) and **Show diagnostics** options.
 - Runs AprilTag detection on the live preview, overlays detected tags, and can compute a colour-correction matrix from a Macbeth chart.
-- Can reflash the ESP32-P4 firmware over USB-OTG without leaving the app.
 - Saves debug preview frames when a complete Macbeth chart is detected.
 
 ## Technology stack
@@ -95,7 +96,7 @@ The application runtime is contained mostly in `DualCameraActivity.kt`. The main
 
 1. **Lifecycle and permissions** (`onCreate`, `checkAndRequestPermissions`, `onRequestPermissionsResult`).
 2. **USB camera client** (`cameraClient`, `IDeviceConnectCallBack` callbacks) — attaches, detaches, permission queues, and camera opening.
-3. **UI state and gestures** — overlay visibility, zoom toggling, key-event logging, flash-progress dialog.
+3. **UI state and gestures** — overlay visibility, zoom toggling, key-event logging, flash-progress dialog, settings popup menu.
 4. **Audio metering** — `startMicMeter`, `startSpeakerMeter`, and their cleanup counterparts.
 5. **AprilTag detection** — periodic capture of the preview bitmap, `AprilTagDetector.detect()`, `AprilTagTracker` filtering, and overlay rendering.
 6. **Macbeth colour correction** — when a supported chart is detected, `MacbethColorCorrector.correctFromAprilTags()` solves a 3×4 affine CCM and applies it automatically to the preview and saved debug frames.
@@ -172,7 +173,7 @@ The app can reflash the ESP32-P4 over the high-speed USB-OTG CDC download port:
    - `bootloader.bin`
    - `partition-table.bin`
    - `usb_webcam.bin`
-2. Tap **Firmware** in the app, or launch the activity with `--ez flash_now true` to skip the confirmation dialog:
+2. Open **Settings → Firmware** in the app, or launch the activity with `--ez flash_now true` to skip the confirmation dialog:
    ```bash
    adb shell am start -S -n com.example.remotesupportheadset/.DualCameraActivity --ez flash_now true
    ```
