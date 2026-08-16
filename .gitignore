@@ -16,12 +16,18 @@ captures/
 *.apk
 output-metadata.json
 
-# IntelliJ
+# IntelliJ / VS Code
 *.iml
 .idea/
+.vscode/
 misc.xml
 deploymentTargetDropDown.xml
 render.experimental.xml
+
+# Gradle wrapper scripts are generated locally; see AGENTS.md build notes
+gradlew
+gradlew.bat
+gradle/wrapper/gradle-wrapper.jar
 
 # Keystore files
 *.jks
