@@ -67,8 +67,7 @@ The CMake build under `app/src/main/cpp/` produces two shared libraries:
 3. Plug in a second camera if desired — it appears in the right slot.
 4. Tap the screen to show/hide labels and controls.
 5. The **MIC** and **SPK** meters at the bottom show live audio levels.
-6. The **Color** button toggles the Macbeth-chart colour-correction matrix once a chart has been detected.
-7. The **Flash Firmware** button reflashes the ESP32-P4 from binaries placed in the device's `Firmware/` directory (see below).
+6. The **Firmware** button reflashes the ESP32-P4 from binaries placed in the device's `Firmware/` directory (see below).
 
 ### AprilTag / Macbeth chart detection
 
@@ -78,7 +77,7 @@ Point the camera at one of the supported AprilTag-coded Macbeth charts (layouts 
 - A colour-correction matrix is computed from the swatches.
 - Debug frames are saved to `/sdcard/Android/data/com.example.remotesupportheadset/files/Pictures/DebugPreview/`.
 
-Toggle **Color** to apply the computed matrix to the live preview.
+The colour-correction matrix is applied automatically to the live preview once it has been computed.
 
 ### ESP32-P4 firmware flashing
 
@@ -93,7 +92,7 @@ adb push build/usb_webcam.bin \
          /sdcard/Android/data/com.example.remotesupportheadset/files/Firmware/usb_webcam.bin
 ```
 
-Then either tap **Flash Firmware** in the app, or start flashing from `adb`:
+Then either tap **Firmware** in the app, or start flashing from `adb`:
 
 ```bash
 adb shell am start -S -n com.example.remotesupportheadset/.DualCameraActivity --ez flash_now true

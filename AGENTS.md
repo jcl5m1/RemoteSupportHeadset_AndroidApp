@@ -13,7 +13,7 @@ Key user-facing behavior:
 - Assigns the first camera to the left slot and the second camera to the right slot.
 - If only one camera is connected, the view automatically zooms to that camera after a short delay.
 - Double-tap a camera feed to toggle zoom; single-tap anywhere to temporarily show labels and controls.
-- Labels, sliders, and the flash button auto-hide after 5 seconds.
+- Labels, sliders, and the firmware button auto-hide after 5 seconds.
 - Displays live MIC and SPK level meters at the bottom.
 - Runs AprilTag detection on the live preview, overlays detected tags, and can compute a colour-correction matrix from a Macbeth chart.
 - Can reflash the ESP32-P4 firmware over USB-OTG without leaving the app.
@@ -98,7 +98,7 @@ The application runtime is contained mostly in `DualCameraActivity.kt`. The main
 3. **UI state and gestures** — overlay visibility, zoom toggling, key-event logging, flash-progress dialog.
 4. **Audio metering** — `startMicMeter`, `startSpeakerMeter`, and their cleanup counterparts.
 5. **AprilTag detection** — periodic capture of the preview bitmap, `AprilTagDetector.detect()`, `AprilTagTracker` filtering, and overlay rendering.
-6. **Macbeth colour correction** — when a supported chart is detected, `MacbethColorCorrector.correctFromAprilTags()` solves a 3×4 affine CCM; the user can toggle correction on/off.
+6. **Macbeth colour correction** — when a supported chart is detected, `MacbethColorCorrector.correctFromAprilTags()` solves a 3×4 affine CCM and applies it automatically to the preview and saved debug frames.
 7. **Firmware flashing** — `startFirmwareFlashFlow()` finds `/Firmware/{bootloader.bin,partition-table.bin,usb_webcam.bin}` under `getExternalFilesDir(null)` and flashes them with `Esp32Flasher`.
 8. **Debug preview save** — `saveDebugPreview()` writes `win_raw.jpg`, `win_annotated.jpg`, and optionally `win_corrected.jpg` to `Pictures/DebugPreview`.
 9. **Anti-banding tool** — `AntiBandingTool` is a stand-alone analysis utility that grabs a vertical slice of the live preview, computes a banding metric with `BandingAnalyzer`, sweeps CSI exposure time via `CdcCommandHelper` to minimize intensity variation, captures the ESP32's own anti-banding exposure and detected flicker frequency, and emits a structured comparison line to `adb logcat` under the `AntiBandResult` tag.  Frames with mean intensity above ~92 % are rejected so the tool does not converge on an overexposed, clipped image.  It is no longer wired to the main UI or intent auto-start; instantiate and call `start()` from a debug/test path when needed.
@@ -162,7 +162,7 @@ You can also open the project in Android Studio and let it sync Gradle automatic
 - Supports the same AprilTag-coded Macbeth chart layouts as `esp32-wearable/tools/chart_configs.py` (`3×3`, `3×4`, `4×4`, `4×6`).
 - When all four corner tags of a known chart are stable, the app samples the swatch interiors and solves a 3×4 affine colour-correction matrix in linear light.
 - The fit is hard-constrained so the observed black and white patches map to `(0,0,0)` and `(255,255,255)`, matching the Python reference decoder.
-- The user can toggle correction with the **Color** button. When on, the preview and saved debug frames are corrected by the matrix; when off, the raw UVC stream is shown.
+- Correction is applied automatically once a CCM has been computed; the raw UVC stream is shown before a chart is detected.
 
 ## ESP32-P4 firmware flashing
 
@@ -172,7 +172,7 @@ The app can reflash the ESP32-P4 over the high-speed USB-OTG CDC download port:
    - `bootloader.bin`
    - `partition-table.bin`
    - `usb_webcam.bin`
-2. Tap **Flash Firmware** in the app, or launch the activity with `--ez flash_now true` to skip the confirmation dialog:
+2. Tap **Firmware** in the app, or launch the activity with `--ez flash_now true` to skip the confirmation dialog:
    ```bash
    adb shell am start -S -n com.example.remotesupportheadset/.DualCameraActivity --ez flash_now true
    ```
@@ -193,7 +193,7 @@ Files:
 
 - `win_raw.jpg` — uncorrected preview bitmap.
 - `win_annotated.jpg` — preview with tag outlines/IDs drawn.
-- `win_corrected.jpg` — colour-corrected bitmap (only when colour correction is enabled and a CCM has been computed).
+- `win_corrected.jpg` — colour-corrected bitmap (only after a CCM has been computed).
 
 Captures are rate-limited to once per 5 seconds to avoid filling storage.
 

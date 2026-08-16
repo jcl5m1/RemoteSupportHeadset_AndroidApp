@@ -110,10 +110,6 @@ class DualCameraActivity : AppCompatActivity() {
     private lateinit var diagnosticsPanel: ScrollView
     private lateinit var diagnosticsText: TextView
     private lateinit var diagnosticsToggle: Button
-    private lateinit var rotateToggle: Button
-    private lateinit var mirrorToggle: Button
-    private lateinit var colorCorrectToggle: Button
-    private lateinit var captureTestToggle: Button
     private lateinit var recordToggle: Button
     private lateinit var recordStop: Button
     private lateinit var flashFirmwareButton: Button
@@ -367,10 +363,6 @@ class DualCameraActivity : AppCompatActivity() {
         diagnosticsPanel = findViewById(R.id.diagnostics_panel)
         diagnosticsText = findViewById(R.id.diagnostics_text)
         diagnosticsToggle = findViewById(R.id.diagnostics_toggle)
-        rotateToggle = findViewById(R.id.rotate_toggle)
-        mirrorToggle = findViewById(R.id.mirror_toggle)
-        colorCorrectToggle = findViewById(R.id.color_correct_toggle)
-        captureTestToggle = findViewById(R.id.capture_test_toggle)
         recordToggle = findViewById(R.id.record_toggle)
         recordStop = findViewById(R.id.record_stop)
         flashFirmwareButton = findViewById(R.id.flash_firmware)
@@ -402,37 +394,6 @@ class DualCameraActivity : AppCompatActivity() {
             diagnosticsToggle.text = if (diagnosticsVisible) "Hide" else "Diag"
             if (diagnosticsVisible) {
                 updateDiagnostics()
-            }
-        }
-
-        rotateToggle.setOnClickListener {
-            cameraPreviewRotation = (cameraPreviewRotation + 90f) % 360f
-            Log.d(TAG, "Camera preview rotation set to $cameraPreviewRotation")
-            applyPreviewRotation()
-        }
-
-        mirrorToggle.setOnClickListener {
-            cameraPreviewMirrorH = !cameraPreviewMirrorH
-            textureCamera.scaleX = if (cameraPreviewMirrorH) -1f else 1f
-            Log.d(TAG, "Camera preview horizontal mirror set to $cameraPreviewMirrorH")
-        }
-
-        colorCorrectToggle.setOnClickListener {
-            colorCorrectionEnabled = !colorCorrectionEnabled
-            colorCorrectToggle.text = if (colorCorrectionEnabled) "Color: ON" else "Color"
-            colorCorrectToggle.backgroundTintList = if (colorCorrectionEnabled) {
-                android.content.res.ColorStateList.valueOf(android.graphics.Color.parseColor("#44AA44"))
-            } else {
-                android.content.res.ColorStateList.valueOf(android.graphics.Color.parseColor("#444444"))
-            }
-            Log.d(TAG, "Color correction enabled=$colorCorrectionEnabled, ccm=${colorCorrectionMatrix != null}")
-        }
-
-        captureTestToggle.setOnClickListener {
-            if (lifecycleTestRunning) {
-                stopLifecycleTest()
-            } else {
-                runLifecycleTest(LIFECYCLE_CAPTURE_COUNT)
             }
         }
 
@@ -802,7 +763,6 @@ class DualCameraActivity : AppCompatActivity() {
         lifecycleTestRunning = true
         lifecycleSuccess = 0
         lifecycleFail = 0
-        updateCaptureTestButton()
         Toast.makeText(this, "Starting $count capture lifecycle test", Toast.LENGTH_SHORT).show()
         Log.i(TAG, "Lifecycle test START: count=$count")
 
@@ -821,7 +781,6 @@ class DualCameraActivity : AppCompatActivity() {
                         lifecycleFail++
                         Log.w(TAG, "Lifecycle test $i/$count: CDC not ready after wait")
                         runOnUiThread {
-                            updateCaptureTestButton()
                             Toast.makeText(this, "CDC not ready, skipping $i", Toast.LENGTH_SHORT).show()
                         }
                         continue
@@ -833,7 +792,6 @@ class DualCameraActivity : AppCompatActivity() {
                         lifecycleFail++
                         Log.w(TAG, "Lifecycle test $i/$count: preview not stable after wait")
                         runOnUiThread {
-                            updateCaptureTestButton()
                             Toast.makeText(this, "Preview not stable, skipping $i", Toast.LENGTH_SHORT).show()
                         }
                         continue
@@ -845,7 +803,6 @@ class DualCameraActivity : AppCompatActivity() {
                     val ok = captureStillImageWithRetries(3)
                     if (ok) lifecycleSuccess++ else lifecycleFail++
                     Log.i(TAG, "Lifecycle test progress $i/$count ok=$ok (success=$lifecycleSuccess fail=$lifecycleFail)")
-                    runOnUiThread { updateCaptureTestButton() }
                     if (i < count && lifecycleTestRunning) {
                         Thread.sleep(LIFECYCLE_CAPTURE_INTERVAL_MS)
                     }
@@ -856,13 +813,11 @@ class DualCameraActivity : AppCompatActivity() {
                 } catch (e: Exception) {
                     lifecycleFail++
                     Log.e(TAG, "Lifecycle test $i/$count unexpected error", e)
-                    runOnUiThread { updateCaptureTestButton() }
                 }
             }
             val elapsed = SystemClock.elapsedRealtime() - start
             lifecycleTestRunning = false
             runOnUiThread {
-                updateCaptureTestButton()
                 val summary = "Lifecycle test done: $lifecycleSuccess/$count in ${elapsed}ms (fail=$lifecycleFail)"
                 Toast.makeText(this, summary, Toast.LENGTH_LONG).show()
                 Log.i(TAG, summary)
@@ -921,12 +876,7 @@ class DualCameraActivity : AppCompatActivity() {
         lifecycleTestRunning = false
         lifecycleTestThread?.interrupt()
         lifecycleTestThread = null
-        updateCaptureTestButton()
         Toast.makeText(this, "Lifecycle test stopped", Toast.LENGTH_SHORT).show()
-    }
-
-    private fun updateCaptureTestButton() {
-        captureTestToggle.text = if (lifecycleTestRunning) "Stop" else "Test 20"
     }
 
     // -------------------------------------------------------------------------
@@ -2210,6 +2160,7 @@ class DualCameraActivity : AppCompatActivity() {
             val result = MacbethColorCorrector.correctFromAprilTags(bitmap, stableDetections)
             if (result != null) {
                 colorCorrectionMatrix = result.ccm
+                colorCorrectionEnabled = true
                 Log.i(TAG, "Updated CCM from ${result.chartName}, mean error=${result.meanError}")
             }
         }
