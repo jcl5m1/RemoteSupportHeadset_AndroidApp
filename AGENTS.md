@@ -139,7 +139,10 @@ You can also open the project in Android Studio and let it sync Gradle automatic
 - `minifyEnabled false` for release builds; ProGuard rules still keep AndroidUSBCamera classes for future use.
 - `sourceCompatibility` / `targetCompatibility` are set to Java 8; Kotlin `jvmTarget` is `1.8`.
 - JitPack is configured in `settings.gradle`. Some transitive dependencies originally hosted on JitPack are pulled directly from MavenCentral in `app/build.gradle` (`immersionbar`, `webpdecoder`) to avoid 401 errors.
-- The NDK CMake build expects the AprilTag3 and `esp-serial-flasher` sources under `app/src/main/cpp/apriltag/` and `app/src/main/cpp/esp-serial-flasher/`. Make sure those directories are populated (submodules or copied) before the first build.
+- The NDK CMake build needs:
+  - `app/src/main/cpp/apriltag/` — vendored AprilTag3 source (included in the repo).
+  - `app/src/main/cpp/esp-serial-flasher/` — registered as a Git submodule pointing to `https://github.com/espressif/esp-serial-flasher.git`.
+  Clone with `--recursive` or run `git submodule update --init --recursive` after cloning to populate the submodule before the first build.
 
 ## AprilTag detection
 

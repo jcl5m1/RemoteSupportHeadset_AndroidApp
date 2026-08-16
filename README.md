@@ -31,6 +31,9 @@ Open the project in **Android Studio** — it will sync Gradle, build the NDK li
 Or from the command line:
 
 ```bash
+# If you cloned without --recursive, fetch the esp-serial-flasher submodule first
+git submodule update --init --recursive
+
 ./gradlew assembleDebug
 adb install app/build/outputs/apk/debug/app-debug.apk
 ```
@@ -44,7 +47,7 @@ The CMake build under `app/src/main/cpp/` produces two shared libraries:
 - `libapriltag_jni.so` — AprilTag3 16h5 detector.
 - `libesp32flasher.so` — Espressif serial-flasher wrapper for USB-CDC firmware updates.
 
-Make sure `app/src/main/cpp/apriltag/` and `app/src/main/cpp/esp-serial-flasher/` are populated before the first build.
+`app/src/main/cpp/apriltag/` is vendored in the repo. `app/src/main/cpp/esp-serial-flasher/` is a Git submodule, so run `git submodule update --init --recursive` if you cloned without `--recursive`.
 
 ### Dependencies
 
