@@ -140,6 +140,9 @@ STALL_RE = re.compile(
 )
 HEALTHY_RE = re.compile(r"Camera health check OK|FPS: \d|AprilTag cycle:")
 
+# CDC command failure emitted by DualCameraActivity.doSingleCapture().
+CDC_CMD_FAIL_RE = re.compile(r"Failed to send capture command \(bulkTransfer returned -?\d+\)")
+
 
 def is_camera_stalled(log: str) -> bool:
     """Return True if the app reports no camera / CDC available."""
@@ -149,6 +152,11 @@ def is_camera_stalled(log: str) -> bool:
 def is_camera_healthy(log: str) -> bool:
     """Return True if the app is receiving preview frames."""
     return bool(HEALTHY_RE.search(log))
+
+
+def has_cdc_command_failure(log: str) -> bool:
+    """Return True if a CDC OUT bulkTransfer failed (separate from preview health)."""
+    return bool(CDC_CMD_FAIL_RE.search(log))
 
 
 def recover_usb_host() -> None:
@@ -191,6 +199,22 @@ def ensure_camera_healthy(recovery_attempts: int = 3) -> bool:
             print("  [recover] Camera healthy again")
             return True
 
+    return False
+
+
+def recover_from_cdc_failure() -> bool:
+    """If a CDC command failure is present, reset the Android USB host port.
+
+    The preview can remain healthy while the CDC OUT endpoint becomes stale,
+    so this checks the failure pattern explicitly and only then runs recovery.
+    """
+    if not has_cdc_command_failure(dump_logcat()):
+        return False
+    print("  [recover] Detected CDC command failure, resetting USB host port...")
+    recover_usb_host()
+    if wait_for_camera_healthy(timeout=60.0):
+        print("  [recover] CDC path recovered (camera healthy)")
+        return True
     return False
 
 
@@ -263,8 +287,11 @@ def main() -> int:
         # If the camera disappeared after this capture, try a software-only
         # USB host reset before proceeding.
         if i < args.count - 1 and not ensure_camera_healthy():
-            print(f"ERROR: Camera did not recover after capture {i}; aborting.")
-            return 1
+            # Preview may still be running while the CDC command path is dead.
+            # Look for that specific failure pattern and reset just the host port.
+            if not recover_from_cdc_failure():
+                print(f"ERROR: Camera did not recover after capture {i}; aborting.")
+                return 1
 
         ev = events.get(i)
         if ev:

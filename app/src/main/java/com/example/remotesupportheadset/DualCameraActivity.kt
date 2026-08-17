@@ -2193,6 +2193,8 @@ class DualCameraActivity : AppCompatActivity() {
         val cmd = "s\r\n".toByteArray(Charsets.UTF_8)
         val written = conn.bulkTransfer(outEp, cmd, cmd.size, CDC_TIMEOUT_MS)
         if (written < 0) {
+            Log.e(TAG, "CDC OUT bulkTransfer failed: written=$written, outEp=0x${outEp.address.toString(16)}, " +
+                    "connection=${conn}, device=${currentDevice?.deviceName}")
             throw RuntimeException("Failed to send capture command (bulkTransfer returned $written)")
         }
 
