@@ -28,6 +28,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
+# Force unbuffered output so progress is visible through tee/pipes.
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
+
 try:
     import matplotlib.pyplot as plt
     import numpy as np
@@ -127,6 +130,68 @@ def wait_for_event(events: dict, index: int, field: str, timeout: float = 30.0) 
     return False
 
 
+# Patterns used to detect an Android USB host stall vs. healthy streaming.
+STALL_RE = re.compile(
+    r"No camera devices initially found|"
+    r"Camera health check: no camera open|"
+    r"Could not open CDC port"
+)
+HEALTHY_RE = re.compile(r"Camera health check OK|FPS: \d")
+
+
+def is_camera_stalled(log: str) -> bool:
+    """Return True if the app reports no camera / CDC available."""
+    return bool(STALL_RE.search(log))
+
+
+def is_camera_healthy(log: str) -> bool:
+    """Return True if the app is receiving preview frames."""
+    return bool(HEALTHY_RE.search(log))
+
+
+def recover_usb_host() -> None:
+    """Reset the Android USB host port via ADB shell (no root required)."""
+    print("  [recover] Resetting Android USB host port...")
+    try:
+        adb(["shell", "svc", "usb", "resetUsbPort"], check=False)
+    except Exception as e:
+        print(f"  [recover] resetUsbPort failed: {e}")
+    time.sleep(2.0)
+    try:
+        adb(["shell", "svc", "usb", "enableUsbDataSignal", "false"], check=False)
+        time.sleep(1.0)
+        adb(["shell", "svc", "usb", "enableUsbDataSignal", "true"], check=False)
+    except Exception as e:
+        print(f"  [recover] enableUsbDataSignal toggle failed: {e}")
+    time.sleep(2.0)
+
+
+def wait_for_camera_healthy(timeout: float = 60.0) -> bool:
+    """Poll logcat until the camera is streaming, or timeout."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        log = dump_logcat()
+        if is_camera_healthy(log):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def ensure_camera_healthy(recovery_attempts: int = 3) -> bool:
+    """Ensure the camera is streaming, running USB host recovery if needed."""
+    if is_camera_healthy(dump_logcat()):
+        return True
+
+    for attempt in range(1, recovery_attempts + 1):
+        print(f"  [recover] Camera not healthy (attempt {attempt}/{recovery_attempts})")
+        recover_usb_host()
+        if wait_for_camera_healthy(timeout=60.0):
+            print("  [recover] Camera healthy again")
+            return True
+
+    return False
+
+
 def histogram(values: List[float], title: str, xlabel: str, output_path: Path) -> None:
     plt.figure(figsize=(8, 5))
     plt.hist(values, bins="auto", edgecolor="black")
@@ -166,6 +231,11 @@ def main() -> int:
     events: dict[int, Event] = {}
     clear_logcat()
 
+    print("Ensuring camera is healthy before starting...")
+    if not ensure_camera_healthy():
+        print("ERROR: Camera did not become healthy; aborting.")
+        return 1
+
     for i in range(args.count):
         wait_s = random.uniform(args.wait_min, args.wait_max)
         if i > 0:
@@ -187,6 +257,12 @@ def main() -> int:
         print(f"Tap {i}: waiting for stream resume...")
         if not wait_for_event(events, i, "resumed_ms", timeout=60.0):
             print(f"  WARNING: capture {i} stream did not resume in time")
+
+        # If the camera disappeared after this capture, try a software-only
+        # USB host reset before proceeding.
+        if i < args.count - 1 and not ensure_camera_healthy():
+            print(f"ERROR: Camera did not recover after capture {i}; aborting.")
+            return 1
 
         ev = events.get(i)
         if ev:
