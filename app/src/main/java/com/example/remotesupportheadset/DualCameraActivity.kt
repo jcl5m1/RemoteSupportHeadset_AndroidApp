@@ -111,6 +111,14 @@ class DualCameraActivity : AppCompatActivity() {
         const val EXTRA_FLASH_NOW = "flash_now"
         /** Intent extra that provides a firmware .zip URL to download before flashing. */
         const val EXTRA_FIRMWARE_URL = "firmware_url"
+        /** Intent extra that triggers a single still capture immediately. */
+        const val EXTRA_CAPTURE_NOW = "capture_now"
+        /** Intent extra that runs the still-capture lifecycle test with the given count. */
+        const val EXTRA_LIFECYCLE_TEST_COUNT = "lifecycle_test_count"
+        /** Intent extra that opens the zoom overlay for the last captured image. */
+        const val EXTRA_ZOOM_OPEN = "zoom_open"
+        /** Intent extra that closes the zoom overlay. */
+        const val EXTRA_ZOOM_CLOSE = "zoom_close"
     }
 
     private lateinit var surfaceCamera: AspectRatioSurfaceView
@@ -498,6 +506,27 @@ class DualCameraActivity : AppCompatActivity() {
         } else if (intent?.getBooleanExtra(EXTRA_FLASH_NOW, false) == true) {
             Log.d(TAG, "EXTRA_FLASH_NOW requested, starting flash flow without confirmation")
             startFirmwareFlashFlow(skipConfirmation = true)
+        }
+
+        // Allow external callers to trigger capture or a lifecycle stress test.
+        if (intent?.getBooleanExtra(EXTRA_CAPTURE_NOW, false) == true) {
+            Log.d(TAG, "EXTRA_CAPTURE_NOW requested")
+            captureStillImage()
+        }
+        intent?.getIntExtra(EXTRA_LIFECYCLE_TEST_COUNT, 0)?.let { count ->
+            if (count > 0) {
+                Log.d(TAG, "EXTRA_LIFECYCLE_TEST_COUNT=$count requested")
+                runLifecycleTest(count)
+            }
+        }
+
+        if (intent?.getBooleanExtra(EXTRA_ZOOM_OPEN, false) == true) {
+            Log.d(TAG, "EXTRA_ZOOM_OPEN requested")
+            lastCapturedFile?.let { showZoomOverlay(it) }
+        }
+        if (intent?.getBooleanExtra(EXTRA_ZOOM_CLOSE, false) == true) {
+            Log.d(TAG, "EXTRA_ZOOM_CLOSE requested")
+            hideZoomOverlay()
         }
 
     }
@@ -2385,9 +2414,16 @@ class DualCameraActivity : AppCompatActivity() {
                 }
                 val sourceForThumbnail = annotated ?: bitmap
                 val thumbnail = Bitmap.createScaledBitmap(sourceForThumbnail, targetWidth, targetHeight, true)
+
+                // Keep the annotated full image for the zoom overlay. Recycle the
+                // previous one first so we don't accumulate full-resolution bitmaps.
+                lastAnnotatedFull?.takeIf { !it.isRecycled }?.recycle()
                 lastAnnotatedFull = annotated ?: BitmapFactory.decodeFile(file.absolutePath)
+
+                // The original decoded bitmap is no longer needed; ownership of the
+                // annotated image has been transferred to lastAnnotatedFull.
                 bitmap.recycle()
-                if (annotated !== bitmap) annotated?.recycle()
+
                 lastCapturedThumbnail = thumbnail
                 runOnUiThread {
                     if (!isZoomOpen) {
@@ -2415,8 +2451,11 @@ class DualCameraActivity : AppCompatActivity() {
     private fun showZoomOverlay(file: File) {
         try {
             // Prefer the annotated full image if AprilTag detection has finished.
-            val bitmap = lastAnnotatedFull ?: BitmapFactory.decodeFile(file.absolutePath)
-                ?: return
+            val cached = lastAnnotatedFull
+            val bitmap = when {
+                cached != null && !cached.isRecycled -> cached
+                else -> BitmapFactory.decodeFile(file.absolutePath)
+            } ?: return
             zoomImage.setImageBitmap(bitmap)
             zoomOverlay.visibility = View.VISIBLE
             isZoomOpen = true
@@ -3162,6 +3201,25 @@ class DualCameraActivity : AppCompatActivity() {
         } else if (intent?.getBooleanExtra(EXTRA_FLASH_NOW, false) == true) {
             Log.d(TAG, "onNewIntent: EXTRA_FLASH_NOW requested, starting flash flow without confirmation")
             startFirmwareFlashFlow(skipConfirmation = true)
+        }
+
+        if (intent?.getBooleanExtra(EXTRA_CAPTURE_NOW, false) == true) {
+            Log.d(TAG, "onNewIntent: EXTRA_CAPTURE_NOW requested")
+            captureStillImage()
+        }
+        intent?.getIntExtra(EXTRA_LIFECYCLE_TEST_COUNT, 0)?.let { count ->
+            if (count > 0) {
+                Log.d(TAG, "onNewIntent: EXTRA_LIFECYCLE_TEST_COUNT=$count requested")
+                runLifecycleTest(count)
+            }
+        }
+        if (intent?.getBooleanExtra(EXTRA_ZOOM_OPEN, false) == true) {
+            Log.d(TAG, "onNewIntent: EXTRA_ZOOM_OPEN requested")
+            lastCapturedFile?.let { showZoomOverlay(it) }
+        }
+        if (intent?.getBooleanExtra(EXTRA_ZOOM_CLOSE, false) == true) {
+            Log.d(TAG, "onNewIntent: EXTRA_ZOOM_CLOSE requested")
+            hideZoomOverlay()
         }
     }
 
