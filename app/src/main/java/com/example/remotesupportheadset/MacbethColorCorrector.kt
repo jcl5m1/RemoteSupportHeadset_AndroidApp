@@ -234,9 +234,8 @@ object MacbethColorCorrector {
         chart: ChartLayout,
         homography: Matrix
     ): List<Pair<Swatch, Int>> {
-        val inverse = Matrix()
-        if (!homography.invert(inverse)) return emptyList()
-
+        // estimateHomography builds a chart-space -> bitmap-space mapping, so we
+        // apply it directly to each virtual swatch center to find where to sample.
         val radius = max(1, CELL / 12)
         val result = mutableListOf<Pair<Swatch, Int>>()
         val pts = FloatArray(chart.swatches.size * 2)
@@ -245,7 +244,7 @@ object MacbethColorCorrector {
             pts[i * 2] = cx
             pts[i * 2 + 1] = cy
         }
-        inverse.mapPoints(pts)
+        homography.mapPoints(pts)
 
         for ((i, swatch) in chart.swatches.withIndex()) {
             val cx = pts[i * 2].toInt()

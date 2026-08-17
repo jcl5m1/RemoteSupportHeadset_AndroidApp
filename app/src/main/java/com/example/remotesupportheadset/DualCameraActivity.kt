@@ -2362,7 +2362,8 @@ class DualCameraActivity : AppCompatActivity() {
             exif.setAttribute(ExifInterface.TAG_DATETIME, dateTime)
             exif.setAttribute(ExifInterface.TAG_DATETIME_ORIGINAL, dateTime)
             exif.setAttribute(ExifInterface.TAG_DATETIME_DIGITIZED, dateTime)
-            // Pixels are rotated to upright in rotateAndCorrectFullResJpeg().
+            // The still image is rotated 90° counter-clockwise in
+            // correctFullResJpeg() so the EXIF orientation is normal.
             exif.setAttribute(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL.toString())
 
             getCurrentLocation()?.let { loc ->
@@ -2397,7 +2398,7 @@ class DualCameraActivity : AppCompatActivity() {
         // The firmware's full-resolution DVP output is currently upside-down
         // relative to the upright live preview. Rotate it and apply the active
         // colour-correction matrix if one has been computed from a Macbeth chart.
-        rotateAndCorrectFullResJpeg(file)
+        correctFullResJpeg(file)
 
         writeJpegMetadata(file)
         MediaScannerConnection.scanFile(this, arrayOf(file.absolutePath), arrayOf("image/jpeg"), null)
@@ -2407,24 +2408,25 @@ class DualCameraActivity : AppCompatActivity() {
     }
 
     /**
-     * Decode a freshly saved full-resolution JPEG, rotate it 180° to match the
-     * upright preview, and apply the active CCM. The file is overwritten with
-     * the processed image. Large images (>24 MP) are skipped to avoid OOM.
+     * Decode the freshly saved full-resolution JPEG and rotate it 90°
+     * counter-clockwise so the chart/text in the mechanically rotated camera
+     * appears upright. The file is overwritten with the rotated image. Large
+     * images (>24 MP) are skipped to avoid OOM.
      */
-    private fun rotateAndCorrectFullResJpeg(file: File) {
+    private fun correctFullResJpeg(file: File) {
         try {
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeFile(file.absolutePath, bounds)
             val width = bounds.outWidth
             val height = bounds.outHeight
             if (width <= 0 || height <= 0) {
-                Log.w(TAG, "Cannot rotate/correct ${file.name}: invalid dimensions")
+                Log.w(TAG, "Cannot rotate ${file.name}: invalid dimensions")
                 return
             }
 
             val megapixels = (width.toLong() * height.toLong()) / 1_000_000.0
             if (megapixels > 24) {
-                Log.w(TAG, "Skipping rotation/CCM for ${file.name}: ${"%.1f".format(megapixels)}MP is too large")
+                Log.w(TAG, "Skipping rotation for ${file.name}: ${"%.1f".format(megapixels)}MP is too large")
                 return
             }
 
@@ -2437,31 +2439,23 @@ class DualCameraActivity : AppCompatActivity() {
                     return
                 }
 
-            val rotated = rotateBitmap180(original)
+            val rotated = rotateBitmap90Ccw(original)
             original.recycle()
 
-            val corrected = if (colorCorrectionEnabled && colorCorrectionMatrix != null) {
-                val applied = MacbethColorCorrector.applyCcm(rotated, colorCorrectionMatrix!!)
-                rotated.recycle()
-                applied
-            } else {
-                rotated
-            }
-
             FileOutputStream(file).use { out ->
-                corrected.compress(Bitmap.CompressFormat.JPEG, 95, out)
+                rotated.compress(Bitmap.CompressFormat.JPEG, 95, out)
             }
-            corrected.recycle()
-            Log.i(TAG, "Processed full-resolution ${file.name}: ${width}x${height}, ccmApplied=${colorCorrectionEnabled}")
+            rotated.recycle()
+            Log.i(TAG, "Rotated full-resolution ${file.name}: ${width}x${height} -> ${rotated.width}x${rotated.height}")
         } catch (e: OutOfMemoryError) {
-            Log.e(TAG, "Out of memory rotating/correcting ${file.name}", e)
+            Log.e(TAG, "Out of memory rotating ${file.name}", e)
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to rotate/correct ${file.name}", e)
+            Log.e(TAG, "Failed to rotate ${file.name}", e)
         }
     }
 
-    private fun rotateBitmap180(bitmap: Bitmap): Bitmap {
-        val matrix = Matrix().apply { postRotate(180f) }
+    private fun rotateBitmap90Ccw(bitmap: Bitmap): Bitmap {
+        val matrix = Matrix().apply { postRotate(-90f) }
         return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
     }
 
