@@ -42,6 +42,7 @@ import android.view.WindowManager
 import android.util.Log
 import androidx.exifinterface.media.ExifInterface
 import android.view.MotionEvent
+import android.view.SurfaceHolder
 import android.view.View
 import android.widget.Button
 import androidx.appcompat.widget.PopupMenu
@@ -64,7 +65,7 @@ import com.jiangdg.ausbc.callback.IDeviceConnectCallBack
 import com.jiangdg.ausbc.callback.IPreviewDataCallBack
 import com.jiangdg.ausbc.camera.bean.CameraRequest
 import com.jiangdg.ausbc.camera.bean.PreviewSize
-import com.jiangdg.ausbc.widget.AspectRatioTextureView
+import com.jiangdg.ausbc.widget.AspectRatioSurfaceView
 import com.serenegiant.usb.USBMonitor
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -76,6 +77,7 @@ import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantLock
 import java.util.zip.ZipInputStream
@@ -111,7 +113,7 @@ class DualCameraActivity : AppCompatActivity() {
         const val EXTRA_FIRMWARE_URL = "firmware_url"
     }
 
-    private lateinit var textureCamera: AspectRatioTextureView
+    private lateinit var surfaceCamera: AspectRatioSurfaceView
     private lateinit var aprilTagOverlay: AprilTagOverlayView
     private lateinit var statusCamera: TextView
     private lateinit var labelCamera: TextView
@@ -176,7 +178,7 @@ class DualCameraActivity : AppCompatActivity() {
     private var cameraPreviewRotation = 0f
 
     // Horizontal mirror of the live preview. Some UVC modules deliver a left-right mirrored
-    // stream; toggling this mirrors the TextureView so the on-screen preview looks correct.
+    // stream; toggling this mirrors the preview surface so the on-screen preview looks correct.
     private var cameraPreviewMirrorH = false
 
     private var lastCapturedFile: File? = null
@@ -185,6 +187,14 @@ class DualCameraActivity : AppCompatActivity() {
     private var lastDebugPreviewSaveTime = 0L
     private val aprilTagDetector by lazy { AprilTagDetector() }
     private val aprilTagTracker = AprilTagTracker()
+
+    // Latest NV21 preview frame from the camera callback. We keep a small queue
+    // so the detection thread can consume frames at its own rate without blocking
+    // the camera callback thread.
+    private val previewFrameQueue = ArrayBlockingQueue<PreviewFrame>(2)
+    private var previewFrameWidth = 0
+    private var previewFrameHeight = 0
+    private data class PreviewFrame(val data: ByteArray, val width: Int, val height: Int)
 
     // 3x3 colour-correction matrix computed from a detected Macbeth chart.
     private var colorCorrectionMatrix: FloatArray? = null
@@ -202,11 +212,26 @@ class DualCameraActivity : AppCompatActivity() {
 
     private var aprilTagThread: android.os.HandlerThread? = null
     private var aprilTagHandler: Handler? = null
+    private var aprilTagCycleCount = 0L
+    private var aprilTagLastSummaryTime = 0L
+
     private val aprilTagRunnable = object : Runnable {
         override fun run() {
             if (isFinishing) return
+            val cycleStart = SystemClock.elapsedRealtime()
             updateLiveAprilTagOverlay()
-            aprilTagHandler?.postDelayed(this, 200)
+            val elapsed = SystemClock.elapsedRealtime() - cycleStart
+            aprilTagCycleCount++
+            val now = SystemClock.elapsedRealtime()
+            if (now - aprilTagLastSummaryTime >= 1000L) {
+                Log.d(TAG, "AprilTag rate: $aprilTagCycleCount cycles/s, last cycle=${elapsed}ms")
+                aprilTagCycleCount = 0
+                aprilTagLastSummaryTime = now
+            }
+            // The old 200 ms delay artificially limited live detection to 5 Hz.
+            // Now schedule the next frame as soon as possible, capped at ~30 Hz
+            // so we do not waste CPU redetecting the same preview frame.
+            aprilTagHandler?.postDelayed(this, maxOf(0L, 33L - elapsed))
         }
     }
 
@@ -352,17 +377,48 @@ class DualCameraActivity : AppCompatActivity() {
         override fun onPreviewData(data: ByteArray?, format: IPreviewDataCallBack.DataFormat) {
             frameCount.incrementAndGet()
             lastFrameTime = SystemClock.elapsedRealtime()
-            val request = currentCamera?.getCameraRequest()
             val previewSize = currentCamera?.getPreviewSize()
-            if (request != null && previewSize != null) {
-                // Log a sample frame every ~60 frames (about once per second) so the ring
-                // buffer is not flooded and recovery/capture diagnostics remain visible.
+            if (data != null && previewSize != null) {
+                previewFrameWidth = previewSize.width
+                previewFrameHeight = previewSize.height
+                // Keep only the latest frame for detection. Copy the data because the
+                // library may reuse the underlying buffer.
+                val copy = data.copyOf()
+                previewFrameQueue.poll()?.let { }
+                previewFrameQueue.offer(PreviewFrame(copy, previewSize.width, previewSize.height))
+                // Log a sample frame every ~60 frames (about once per second).
                 val count = frameCount.get()
                 if (count % 60L == 0L) {
                     Log.v(TAG, "Preview frame sample [$count]: ${previewSize.width}x${previewSize.height}, " +
-                            "data=${data?.size ?: 0}, format=$format")
+                            "data=${data.size}, format=$format")
                 }
             }
+        }
+    }
+
+    private var pendingCameraSetup: PendingCameraSetup? = null
+    private data class PendingCameraSetup(
+        val camera: MultiCameraClient.Camera,
+        val request: CameraRequest,
+        val ctrlBlock: USBMonitor.UsbControlBlock?
+    )
+
+    private val surfaceCallback = object : SurfaceHolder.Callback {
+        override fun surfaceCreated(holder: SurfaceHolder) {
+            Log.d(TAG, "Preview surface created")
+            pendingCameraSetup?.let { setup ->
+                openCameraWithSetup(setup)
+                pendingCameraSetup = null
+            }
+        }
+
+        override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+            Log.d(TAG, "Preview surface changed: ${width}x${height}")
+        }
+
+        override fun surfaceDestroyed(holder: SurfaceHolder) {
+            Log.d(TAG, "Preview surface destroyed")
+            currentCamera?.closeCamera()
         }
     }
 
@@ -374,7 +430,7 @@ class DualCameraActivity : AppCompatActivity() {
         hideSystemUI()
         keepScreenOn()
 
-        textureCamera = findViewById(R.id.texture_camera)
+        surfaceCamera = findViewById(R.id.surface_camera)
         statusCamera = findViewById(R.id.status_camera)
         labelCamera = findViewById(R.id.label_camera)
         tapHint = findViewById(R.id.tap_hint)
@@ -393,11 +449,15 @@ class DualCameraActivity : AppCompatActivity() {
         firmwareVersionLabel = findViewById(R.id.firmware_version_label)
         aprilTagOverlay = findViewById(R.id.apriltag_overlay)
 
+        // SurfaceView renders the camera stream directly; the overlay View sits above it.
+        surfaceCamera.setZOrderMediaOverlay(true)
+        surfaceCamera.holder.addCallback(surfaceCallback)
+
         applyPreviewRotation()
         startLiveAprilTagDetection()
 
-        // Tap anywhere on the texture to capture a still image (debounced)
-        textureCamera.setOnTouchListener { _, event ->
+        // Tap anywhere on the preview to capture a still image (debounced)
+        surfaceCamera.setOnTouchListener { _, event ->
             if (event.action == MotionEvent.ACTION_UP) {
                 captureStillImage()
             }
@@ -507,15 +567,16 @@ class DualCameraActivity : AppCompatActivity() {
                         .setPreviewHeight(PREVIEW_HEIGHT)
                         .create()
 
-                    camera.openCamera(textureCamera, request)
-                    currentCamera = camera
-                    cameraOpenedTime = SystemClock.elapsedRealtime()
-                    lastFrameTime = 0L
+                    val setup = PendingCameraSetup(camera, request, ctrlBlock)
+                    if (surfaceCamera.holder.surface?.isValid == true) {
+                        openCameraWithSetup(setup)
+                    } else {
+                        pendingCameraSetup = setup
+                        Log.d(TAG, "Camera setup pending until SurfaceView is ready")
+                    }
 
                     statusCamera.visibility = View.GONE
                     labelCamera.text = "${PREVIEW_WIDTH}x${PREVIEW_HEIGHT} @ -- FPS"
-
-                    Log.d(TAG, "Camera opened: ${device.deviceName}")
 
                     // Try to claim the CDC interface on the same composite device
                     ctrlBlock?.let { setupCdc(device, it) }
@@ -2379,15 +2440,12 @@ class DualCameraActivity : AppCompatActivity() {
 
     /**
      * Copy the current live preview frame into the thumbnail ImageView.
-     * Called on the main thread; getBitmap() does a GPU readback.
+     * With SurfaceView preview this would require a full NV21→Bitmap conversion,
+     * so we leave the thumbnail showing the last captured still image.
      */
     private fun updateThumbnailWithLiveFrame() {
-        try {
-            val bmp = textureCamera.bitmap ?: return
-            thumbnailLastCapture.setImageBitmap(bmp)
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to update live thumbnail", e)
-        }
+        // SurfaceView does not expose a getBitmap() API. Live preview in the
+        // thumbnail is disabled to avoid GPU/CPU readback.
     }
 
     private fun queuePermissionRequest(device: UsbDevice) {
@@ -2431,9 +2489,26 @@ class DualCameraActivity : AppCompatActivity() {
     }
 
     /**
-     * Applies the software-defined [cameraPreviewRotation] to the preview texture.
+     * Open the camera once both the USB control block and the SurfaceView Surface
+     * are ready. Called on the main thread.
+     */
+    private fun openCameraWithSetup(setup: PendingCameraSetup) {
+        try {
+            setup.camera.openCamera(surfaceCamera, setup.request)
+            currentCamera = setup.camera
+            cameraOpenedTime = SystemClock.elapsedRealtime()
+            lastFrameTime = 0L
+            Log.d(TAG, "Camera opened on SurfaceView")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to open camera on SurfaceView", e)
+            setup.camera.closeCamera()
+        }
+    }
+
+    /**
+     * Applies the software-defined [cameraPreviewRotation] to the preview surface.
      *
-     * The [AspectRatioTextureView] public setter swaps width/height based on the
+     * The [AspectRatioSurfaceView] public setter swaps width/height based on the
      * device's configuration orientation. We pass the dimensions in the order that
      * makes the final measured aspect ratio match the *displayed* frame (after
      * applying [cameraPreviewRotation]), so the preview is never stretched.
@@ -2452,11 +2527,10 @@ class DualCameraActivity : AppCompatActivity() {
         // and landscape; compensate so the resulting ratio is displayedW/displayedH.
         val isPortrait = resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT
         if (isPortrait) {
-            textureCamera.setAspectRatio(displayedH.toInt(), displayedW.toInt())
+            surfaceCamera.setAspectRatio(displayedH.toInt(), displayedW.toInt())
         } else {
-            textureCamera.setAspectRatio(displayedW.toInt(), displayedH.toInt())
+            surfaceCamera.setAspectRatio(displayedW.toInt(), displayedH.toInt())
         }
-        textureCamera.rotation = effectiveRotation
         Log.d(TAG, "Applied preview rotation: effective=$effectiveRotation, frame=${frameW.toInt()}x${frameH.toInt()}, displayed=${displayedW.toInt()}x${displayedH.toInt()}")
     }
 
@@ -2484,78 +2558,123 @@ class DualCameraActivity : AppCompatActivity() {
     }
 
     /**
-     * Grab the current preview bitmap and run AprilTag detection directly.
-     * The live stream is already upright thanks to the sensor-level vertical
-     * flip in the ESP32 firmware, so no software orientation search is done here.
+     * Grab the latest NV21 preview frame from the camera callback and run AprilTag
+     * detection on its Y plane. The live stream is already upright thanks to the
+     * sensor-level vertical flip in the ESP32 firmware, so no software orientation
+     * search is done here.
      *
      * Detections are passed through [aprilTagTracker] so only temporally stable
-     * tags are drawn.  When a complete Macbeth chart is seen, a colour-correction
-     * matrix is computed and stored for later debug saves.
+     * tags are drawn. When a complete Macbeth chart is seen, the full NV21 frame
+     * is converted to a colour Bitmap for the colour-correction matrix and debug
+     * save; this expensive conversion is only done when needed.
      */
     private fun updateLiveAprilTagOverlay() {
         if (currentCamera == null || isFinishing) return
-        val bitmap = try {
-            textureCamera.bitmap
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to get preview bitmap for AprilTag detection", e)
-            return
-        } ?: return
+        val frame = previewFrameQueue.poll() ?: return
+        val frameW = frame.width
+        val frameH = frame.height
 
-        val detections = try {
-            aprilTagDetector.detect(bitmap, annotate = false).first
+        val detectStart = SystemClock.elapsedRealtime()
+        val (detections, detectW, detectH) = try {
+            // Use only the Y plane (first width*height bytes) for fast grayscale detection.
+            // Subsample to 640x480 so the detector's internal quad_decimate=2 pipeline
+            // runs at 320x240, giving the same stable, low-jitter behaviour we had with
+            // the TextureView bitmap path while avoiding the GPU readback and RGB conversion.
+            val yPlane = frame.data.copyOfRange(0, frameW * frameH)
+            val (scaledY, scaledW, scaledH) = subsampleYPlane(yPlane, frameW, frameH, 640, 480)
+            aprilTagTracker.maxPositionJumpPx = 24f
+            Triple(aprilTagDetector.detectGray(scaledY, scaledW, scaledH), scaledW, scaledH)
         } catch (e: Exception) {
             Log.w(TAG, "AprilTag detection failed", e)
-            bitmap.recycle()
             return
         }
+        val detectTime = SystemClock.elapsedRealtime() - detectStart
 
+        val trackStart = SystemClock.elapsedRealtime()
         val stableDetections = aprilTagTracker.update(detections)
+        val trackTime = SystemClock.elapsedRealtime() - trackStart
 
-        // Compute a CCM whenever we have a complete chart in the upright frame.
-        if (stableDetections.count { it.id in MACBETH_CORNER_IDS } >= 4) {
-            val result = MacbethColorCorrector.correctFromAprilTags(bitmap, stableDetections)
-            if (result != null) {
-                colorCorrectionMatrix = result.ccm
-                colorCorrectionEnabled = true
-                Log.i(TAG, "Updated CCM from ${result.chartName}, mean error=${result.meanError}")
-            }
+        if (detections.isNotEmpty() || stableDetections.isNotEmpty()) {
+            Log.d(TAG, "AprilTag cycle: frame=${frameW}x${frameH} detect=${detectTime}ms track=${trackTime}ms raw=${detections.size} stable=${stableDetections.size}")
         }
 
         if (stableDetections.isEmpty()) {
-            bitmap.recycle()
             runOnUiThread { aprilTagOverlay.detections = emptyList() }
             return
         }
 
-        Log.d(TAG, "Live AprilTag overlay: raw=${detections.size}, stable=${stableDetections.size}")
-
-        // The TextureView's transform maps bitmap coordinates to the view's
-        // on-screen coordinates. The overlay view covers the same area, so the
-        // same transform puts the corners in the right place.
-        val matrix = Matrix()
-        textureCamera.getTransform(matrix)
+        // Map detections from detection-frame coordinates to the overlay view's
+        // coordinate space. AspectRatioSurfaceView preserves the camera aspect ratio
+        // and fits the video inside the container with top|center_horizontal gravity,
+        // so the active video area is a centered, aspect-ratio-preserving rectangle.
         val overlayW = aprilTagOverlay.width.toFloat()
-        val mirrorH = cameraPreviewMirrorH
+        val overlayH = aprilTagOverlay.height.toFloat()
+        val cameraAspect = if (detectH > 0) detectW.toFloat() / detectH else 0f
+        val overlayAspect = if (overlayH > 0) overlayW / overlayH else 0f
 
+        // Compute the rendered video rectangle within the overlay (uniform scale).
+        val renderedW: Float
+        val renderedH: Float
+        val offsetX: Float
+        val offsetY: Float
+        if (overlayW <= 0 || overlayH <= 0 || cameraAspect <= 0f) {
+            renderedW = overlayW
+            renderedH = overlayH
+            offsetX = 0f
+            offsetY = 0f
+        } else if (overlayAspect > cameraAspect) {
+            // Container is wider than camera: fit to height, letterbox left/right.
+            renderedH = overlayH
+            renderedW = renderedH * cameraAspect
+            offsetX = (overlayW - renderedW) / 2f
+            offsetY = 0f
+        } else {
+            // Container is taller than camera (or same aspect): fit to width, letterbox top/bottom.
+            renderedW = overlayW
+            renderedH = renderedW / cameraAspect
+            offsetX = (overlayW - renderedW) / 2f
+            offsetY = 0f
+        }
+
+        val scale = if (detectW > 0) renderedW / detectW else if (detectH > 0) renderedH / detectH else 1f
+
+        val mirrorH = cameraPreviewMirrorH
         val overlayDetections = stableDetections.map { d ->
             val mappedCorners = d.corners.map { (x, y) ->
-                val pts = floatArrayOf(x, y)
-                matrix.mapPoints(pts)
-                if (mirrorH && overlayW > 0f) {
-                    pts[0] = overlayW - pts[0]
+                var vx = offsetX + x * scale
+                val vy = offsetY + y * scale
+                if (mirrorH && renderedW > 0f) {
+                    vx = offsetX + renderedW - (x * scale)
                 }
-                pts[0] to pts[1]
+                vx to vy
             }
             AprilTagOverlayView.Detection(d.id, mappedCorners)
         }
 
         runOnUiThread { aprilTagOverlay.detections = overlayDetections }
 
-        // Save the debug frame whenever we find all four corner AprilTags.
-        if (stableDetections.count { it.id in MACBETH_CORNER_IDS } >= 4) {
-            saveDebugPreview(bitmap, stableDetections)
-        } else {
-            bitmap.recycle()
+        // Scale stable detections back to the original camera-frame coordinate space
+        // for Macbeth chart decoding and debug saves, then convert to colour Bitmap.
+        val ccmScaleX = if (detectW > 0) frameW.toFloat() / detectW else 1f
+        val ccmScaleY = if (detectH > 0) frameH.toFloat() / detectH else 1f
+        val frameStableDetections = stableDetections.map { d ->
+            AprilTagDetector.Detection(
+                d.id,
+                d.corners.map { (x, y) -> (x * ccmScaleX) to (y * ccmScaleY) }
+            )
+        }
+
+        if (frameStableDetections.count { it.id in MACBETH_CORNER_IDS } >= 4) {
+            val bitmap = nv21ToBitmap(frame.data, frameW, frameH)
+            if (bitmap != null) {
+                val result = MacbethColorCorrector.correctFromAprilTags(bitmap, frameStableDetections)
+                if (result != null) {
+                    colorCorrectionMatrix = result.ccm
+                    colorCorrectionEnabled = true
+                    Log.i(TAG, "Updated CCM from ${result.chartName}, mean error=${result.meanError}")
+                }
+                saveDebugPreview(bitmap, frameStableDetections)
+            }
         }
     }
 
@@ -2606,6 +2725,78 @@ class DualCameraActivity : AppCompatActivity() {
                 bitmap.recycle()
             }
         }.start()
+    }
+
+    /**
+     * Subsample a Y-plane byte buffer to roughly [targetWidth]x[targetHeight]
+     * using nearest-neighbour sampling. This keeps detection fast and stable
+     * while the SurfaceView still renders the full-resolution camera stream.
+     */
+    private fun subsampleYPlane(
+        yPlane: ByteArray,
+        srcW: Int,
+        srcH: Int,
+        targetWidth: Int,
+        targetHeight: Int
+    ): Triple<ByteArray, Int, Int> {
+        if (srcW <= targetWidth && srcH <= targetHeight) {
+            return Triple(yPlane, srcW, srcH)
+        }
+        val scaleX = srcW.toFloat() / targetWidth.toFloat()
+        val scaleY = srcH.toFloat() / targetHeight.toFloat()
+        val scale = maxOf(scaleX, scaleY)
+        val dstW = (srcW / scale).toInt().coerceAtLeast(1)
+        val dstH = (srcH / scale).toInt().coerceAtLeast(1)
+        val dst = ByteArray(dstW * dstH)
+        var di = 0
+        for (y in 0 until dstH) {
+            val sy = (y * scale).toInt().coerceIn(0, srcH - 1)
+            val srcRow = sy * srcW
+            for (x in 0 until dstW) {
+                val sx = (x * scale).toInt().coerceIn(0, srcW - 1)
+                dst[di++] = yPlane[srcRow + sx]
+            }
+        }
+        return Triple(dst, dstW, dstH)
+    }
+
+    /**
+     * Convert an NV21 byte array to an ARGB_8888 Bitmap. This is only used for
+     * debug saves and colour-correction matrix computation; detection runs directly
+     * on the Y plane to avoid this expensive conversion every frame.
+     */
+    private fun nv21ToBitmap(nv21: ByteArray, width: Int, height: Int): Bitmap? {
+        try {
+            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            val pixels = IntArray(width * height)
+            val ySize = width * height
+            var i = 0
+            for (y in 0 until height) {
+                val yRow = y * width
+                val uvRow = (y shr 1) * width
+                for (x in 0 until width) {
+                    val yVal = (nv21[yRow + x].toInt() and 0xFF) - 16
+                    val uvIndex = uvRow + (x and -2)
+                    val vVal = (nv21[ySize + uvIndex].toInt() and 0xFF) - 128
+                    val uVal = (nv21[ySize + uvIndex + 1].toInt() and 0xFF) - 128
+
+                    var r = (298 * yVal + 409 * vVal + 128) shr 8
+                    var g = (298 * yVal - 100 * uVal - 208 * vVal + 128) shr 8
+                    var b = (298 * yVal + 516 * uVal + 128) shr 8
+
+                    if (r < 0) r = 0 else if (r > 255) r = 255
+                    if (g < 0) g = 0 else if (g > 255) g = 255
+                    if (b < 0) b = 0 else if (b > 255) b = 255
+
+                    pixels[i++] = -0x1000000 or (r shl 16) or (g shl 8) or b
+                }
+            }
+            bitmap.setPixels(pixels, 0, width, 0, 0, width, height)
+            return bitmap
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to convert NV21 to bitmap", e)
+            return null
+        }
     }
 
     private fun shouldRotateDevice(device: UsbDevice): Boolean {

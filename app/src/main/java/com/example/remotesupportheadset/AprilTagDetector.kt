@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.os.SystemClock
 import android.util.Log
 
 /**
@@ -42,16 +43,79 @@ class AprilTagDetector {
     /**
      * Detect AprilTag 16h5 markers in [bitmap].
      * Returns the list of detections and, optionally, an annotated bitmap.
+     *
+     * If [maxDimension] is non-null and the larger side of [bitmap] exceeds it,
+     * the detector scales the image down before running AprilTag detection and
+     * scales the returned corners back to the original [bitmap] coordinate space.
+     * This keeps the overlay and Macbeth chart math aligned while reducing CPU
+     * load on high-resolution TextureView bitmaps.
      */
-    fun detect(bitmap: Bitmap, annotate: Boolean = true): Pair<List<Detection>, Bitmap?> {
-        val detections = nativeDetect(bitmap).toList()
+    fun detect(
+        bitmap: Bitmap,
+        annotate: Boolean = true,
+        maxDimension: Int? = 640
+    ): Pair<List<Detection>, Bitmap?> {
+        val t0 = SystemClock.elapsedRealtimeNanos()
+
+        val scaled = if (maxDimension != null) scaleBitmap(bitmap, maxDimension) else null
+        val detectBitmap = scaled?.bitmap ?: bitmap
+        val scaleX = scaled?.scaleX ?: 1f
+        val scaleY = scaled?.scaleY ?: 1f
+
+        val detections = nativeDetect(detectBitmap).toList().map { d ->
+            if (scaleX == 1f && scaleY == 1f) d
+            else Detection(
+                d.id,
+                d.corners.map { (x, y) -> (x * scaleX) to (y * scaleY) }
+            )
+        }
+
+        scaled?.bitmap?.recycle()
+
+        val t1 = SystemClock.elapsedRealtimeNanos()
+        Log.d(TAG, "detect: ${detectBitmap.width}x${detectBitmap.height} (src ${bitmap.width}x${bitmap.height}) -> ${detections.size} tags in %.2f ms".format((t1 - t0) / 1_000_000.0))
         val annotated = if (annotate && detections.isNotEmpty()) {
             drawDetections(bitmap, detections)
         } else null
         return detections to annotated
     }
 
+    /**
+     * Detect AprilTag 16h5 markers from a grayscale byte buffer.
+     *
+     * [data] must contain at least [width] * [height] bytes in row-major order.
+     * This is the fast path for NV21 Y-plane detection when the preview is
+     * rendered with a SurfaceView.
+     */
+    fun detectGray(data: ByteArray, width: Int, height: Int): List<Detection> {
+        val t0 = SystemClock.elapsedRealtimeNanos()
+        val detections = nativeDetectGray(data, width, height).toList()
+        val t1 = SystemClock.elapsedRealtimeNanos()
+        Log.d(TAG, "detectGray: ${width}x${height} -> ${detections.size} tags in %.2f ms".format((t1 - t0) / 1_000_000.0))
+        return detections
+    }
+
     private external fun nativeDetect(bitmap: Bitmap): Array<Detection>
+    private external fun nativeDetectGray(data: ByteArray, width: Int, height: Int): Array<Detection>
+
+    private data class ScaledBitmap(
+        val bitmap: Bitmap,
+        val scaleX: Float,
+        val scaleY: Float
+    )
+
+    private fun scaleBitmap(bitmap: Bitmap, maxDimension: Int): ScaledBitmap? {
+        val srcW = bitmap.width
+        val srcH = bitmap.height
+        val maxSrc = maxOf(srcW, srcH)
+        if (maxSrc <= maxDimension) return null
+
+        val scale = maxDimension.toFloat() / maxSrc.toFloat()
+        val dstW = (srcW * scale).toInt()
+        val dstH = (srcH * scale).toInt()
+        val scaled = Bitmap.createScaledBitmap(bitmap, dstW, dstH, true)
+        return ScaledBitmap(scaled, srcW.toFloat() / dstW.toFloat(), srcH.toFloat() / dstH.toFloat())
+    }
 
     /**
      * Draw tag outlines and IDs on a copy of [bitmap].

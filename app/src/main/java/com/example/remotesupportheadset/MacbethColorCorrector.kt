@@ -359,10 +359,9 @@ object MacbethColorCorrector {
         for (i in 0 until cols) xtX[i][i] += reg
 
         // p_identity has a 1 in the slot for this output channel.
-        val channel = when {
-            this === y -> 0 // placeholder; channel is supplied by caller below
-            else -> 0
-        }
+        // The caller supplies the channel identity target via the augmented
+        // right-hand side, so this helper is channel-agnostic.
+        val channel = 0
         // The caller passes y per channel; we identify the channel from the
         // identity target we add.  We add a pull toward R->R, G->G, B->B.
         // Since this helper is called separately per channel, the caller

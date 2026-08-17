@@ -15,7 +15,7 @@ import kotlin.math.hypot
 class AprilTagTracker(
     private val minFrames: Int = 3,
     private val windowFrames: Int = 5,
-    private val maxPositionJumpPx: Float = 24f,
+    var maxPositionJumpPx: Float = 24f,
     private val maxAgeMs: Long = 1200L
 ) {
 

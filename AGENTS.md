@@ -130,7 +130,7 @@ From the project root:
 ./gradlew clean
 ```
 
-**Note:** The Gradle wrapper script (`gradlew` / `gradlew.bat`) is not checked into this repository. To use the command-line commands above, either open the project in Android Studio (which will generate the wrapper) or generate it locally with a system Gradle installation (`gradle wrapper --gradle-version 8.13`).
+The Gradle wrapper (`gradlew` / `gradlew.bat`) is checked into the repository, so the above commands work out of the box.
 
 The debug APK is produced at:
 
@@ -139,6 +139,20 @@ app/build/outputs/apk/debug/app-debug.apk
 ```
 
 You can also open the project in Android Studio and let it sync Gradle automatically.
+
+### Agent build/deploy environment
+
+The agent environment in this workspace is set up to build and deploy the Android app directly. All required tools (JDK, Android SDK, ADB) are installed and available, so agents can and should build, install, and restart the app without claiming any are missing.
+
+- **JDK**: OpenJDK 26 is installed via Homebrew. `JAVA_HOME` is exported in `~/.zshrc`, `~/.bash_profile`, and `~/.bashrc` pointing to the stable Homebrew symlink `/opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home`, which tracks version updates. `java` and `javac` are also symlinked into `~/.local/bin` so they are on `PATH` even for non-interactive shells, and `org.gradle.java.home` is set in `gradle.properties` as a fallback.
+- **Android SDK**: Command-line tools are installed at `/opt/homebrew/share/android-commandlinetools` and referenced by `local.properties` (`sdk.dir=...`).
+- **ADB**: `adb` is on `PATH` at `/opt/homebrew/bin/adb`; one or more physical devices are normally attached over ADB.
+
+So the full build-and-install flow can be run by the agent without opening Android Studio and without manually exporting `JAVA_HOME`:
+
+```bash
+./gradlew installDebug
+```
 
 ### Build configuration notes
 
@@ -150,13 +164,23 @@ You can also open the project in Android Studio and let it sync Gradle automatic
   - `app/src/main/cpp/esp-serial-flasher/` — registered as a Git submodule pointing to `https://github.com/espressif/esp-serial-flasher.git`.
   Clone with `--recursive` or run `git submodule update --init --recursive` after cloning to populate the submodule before the first build.
 
+## Preview rendering
+
+The camera preview is rendered with an `AspectRatioSurfaceView` instead of a `TextureView`. The UVC camera stream is decoded by the AndroidUSBCamera library and sent directly to the SurfaceView's Surface, so the GPU composites it to the screen without an intermediate CPU bitmap readback. This is the most memory-efficient path for live preview.
+
+- The camera stream is rendered at the camera's chosen preview size (e.g. 1280×960).
+- The SurfaceView uses `setZOrderMediaOverlay(true)` so the normal `AprilTagOverlayView` and other UI widgets can sit on top of it in the same window.
+- `TextureView.getBitmap()` is no longer used, so there is no GPU→CPU readback on the preview path.
+
 ## AprilTag detection
 
 - Tag family: **16h5**.
-- Detected on every preview-frame callback in a background thread.
-- Detections are passed through `AprilTagTracker`, which requires a tag to be present in a small spatial window for several consecutive frames before it is reported as stable. This removes most single-frame false positives.
-- Stable detections are drawn on `AprilTagOverlayView` and used by the Macbeth chart decoder.
-- Detection runs directly on the upright preview bitmap. Do not re-introduce orientation permutations in the Android app; orientation is corrected in the ESP32 firmware.
+- Detection runs on the NV21 preview data delivered by `IPreviewDataCallBack` in a background thread.
+- Only the Y plane is used for detection; it is subsampled to 640×480 before being passed to the native detector. This keeps the detector's internal `quad_decimate=2` pipeline running at 320×240 for speed and temporal stability.
+- A full NV21→ARGB conversion is performed only when a complete Macbeth chart is stable, and only for colour-correction matrix computation and debug frame saves.
+- Detections are passed through `AprilTagTracker`, which requires a tag to be present in a small spatial window for several consecutive frames before it is reported as stable. The tracker's `maxPositionJumpPx` is set relative to the detection resolution.
+- Stable detections are drawn on `AprilTagOverlayView` (a normal View on top of the SurfaceView) and used by the Macbeth chart decoder.
+- Detection runs directly on the upright preview frame. Do not re-introduce orientation permutations in the Android app; orientation is corrected in the ESP32 firmware.
 
 ## Macbeth colour correction
 

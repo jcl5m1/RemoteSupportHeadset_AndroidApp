@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "apriltag/apriltag.h"
 #include "apriltag/tag16h5.h"
@@ -29,6 +30,13 @@ static apriltag_detector_t *s_detector = NULL;
 static apriltag_family_t *s_tag_family = NULL;
 static jclass s_detection_class = NULL;
 static jmethodID s_detection_ctor = NULL;
+
+static inline double monotonic_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
 
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved)
 {
@@ -102,11 +110,16 @@ Java_com_example_remotesupportheadset_AprilTagDetector_nativeDetect(
         return env->NewObjectArray(0, s_detection_class, NULL);
     }
 
+    const double t_start = monotonic_ms();
+
     AndroidBitmapInfo info;
     if (AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS) {
         LOGE("AndroidBitmap_getInfo failed");
         return env->NewObjectArray(0, s_detection_class, NULL);
     }
+
+    const char *format_name = (info.format == ANDROID_BITMAP_FORMAT_RGBA_8888) ? "RGBA_8888" :
+                              (info.format == ANDROID_BITMAP_FORMAT_RGB_565) ? "RGB_565" : "other";
 
     if (info.format != ANDROID_BITMAP_FORMAT_RGBA_8888 &&
         info.format != ANDROID_BITMAP_FORMAT_RGB_565) {
@@ -155,7 +168,10 @@ Java_com_example_remotesupportheadset_AprilTagDetector_nativeDetect(
     unlock_pixels(env, bitmap, pixels);
     pixels = NULL;
 
+    const double t_convert = monotonic_ms();
+
     zarray_t *detections = apriltag_detector_detect(s_detector, im);
+    const double t_detect = monotonic_ms();
     image_u8_destroy(im);
 
     int count = zarray_size(detections);
@@ -183,5 +199,96 @@ Java_com_example_remotesupportheadset_AprilTagDetector_nativeDetect(
     }
 
     apriltag_detections_destroy(detections);
+
+    const double t_end = monotonic_ms();
+    LOGI("nativeDetect: %dx%d %s -> %d tags | convert=%.2fms detect=%.2fms total=%.2fms",
+         (int)info.width, (int)info.height, format_name, count,
+         t_convert - t_start, t_detect - t_convert, t_end - t_start);
+
+    return result;
+}
+
+extern "C" JNIEXPORT jobjectArray JNICALL
+Java_com_example_remotesupportheadset_AprilTagDetector_nativeDetectGray(
+    JNIEnv *env,
+    jobject thiz,
+    jbyteArray data,
+    jint width,
+    jint height)
+{
+    (void)thiz;
+
+    if (s_detector == NULL || s_detection_class == NULL || s_detection_ctor == NULL) {
+        LOGE("Native detector not initialized");
+        return env->NewObjectArray(0, s_detection_class, NULL);
+    }
+
+    if (data == NULL || width <= 0 || height <= 0) {
+        return env->NewObjectArray(0, s_detection_class, NULL);
+    }
+
+    const double t_start = monotonic_ms();
+
+    jsize data_len = env->GetArrayLength(data);
+    if (data_len < width * height) {
+        LOGE("Gray buffer too small: %d < %d", (int)data_len, width * height);
+        return env->NewObjectArray(0, s_detection_class, NULL);
+    }
+
+    image_u8_t *im = image_u8_create((int32_t)width, (int32_t)height);
+    if (im == NULL) {
+        return env->NewObjectArray(0, s_detection_class, NULL);
+    }
+
+    jbyte *src = env->GetByteArrayElements(data, NULL);
+    if (src == NULL) {
+        image_u8_destroy(im);
+        return env->NewObjectArray(0, s_detection_class, NULL);
+    }
+
+    const uint8_t *src_gray = (const uint8_t *)src;
+    for (int y = 0; y < height; ++y) {
+        memcpy(im->buf + y * im->stride, src_gray + y * width, width);
+    }
+
+    env->ReleaseByteArrayElements(data, src, JNI_ABORT);
+
+    const double t_convert = monotonic_ms();
+
+    zarray_t *detections = apriltag_detector_detect(s_detector, im);
+    const double t_detect = monotonic_ms();
+    image_u8_destroy(im);
+
+    int count = zarray_size(detections);
+    jobjectArray result = env->NewObjectArray(count, s_detection_class, NULL);
+    if (result == NULL) {
+        apriltag_detections_destroy(detections);
+        return env->NewObjectArray(0, s_detection_class, NULL);
+    }
+
+    for (int i = 0; i < count; ++i) {
+        apriltag_detection_t *det;
+        zarray_get(detections, i, &det);
+
+        jobject obj = env->NewObject(s_detection_class, s_detection_ctor,
+            (jint)det->id,
+            (jfloat)det->p[0][0], (jfloat)det->p[0][1],
+            (jfloat)det->p[1][0], (jfloat)det->p[1][1],
+            (jfloat)det->p[2][0], (jfloat)det->p[2][1],
+            (jfloat)det->p[3][0], (jfloat)det->p[3][1]);
+
+        if (obj != NULL) {
+            env->SetObjectArrayElement(result, i, obj);
+            env->DeleteLocalRef(obj);
+        }
+    }
+
+    apriltag_detections_destroy(detections);
+
+    const double t_end = monotonic_ms();
+    LOGI("nativeDetectGray: %dx%d -> %d tags | copy=%.2fms detect=%.2fms total=%.2fms",
+         (int)width, (int)height, count,
+         t_convert - t_start, t_detect - t_convert, t_end - t_start);
+
     return result;
 }

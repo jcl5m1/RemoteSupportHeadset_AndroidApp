@@ -15,8 +15,8 @@
         android:layout_weight="1"
         android:background="#000000">
 
-        <com.jiangdg.ausbc.widget.AspectRatioTextureView
-            android:id="@+id/texture_camera"
+        <com.jiangdg.ausbc.widget.AspectRatioSurfaceView
+            android:id="@+id/surface_camera"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
             android:layout_gravity="top|center_horizontal" />
