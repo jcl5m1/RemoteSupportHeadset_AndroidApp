@@ -740,6 +740,8 @@ class DualCameraActivity : AppCompatActivity() {
         releaseCdc()
         setupCdc(device, ctrlBlock)
         Log.d(TAG, "CDC refresh: control=${cdcControlInterface != null}, data=${cdcDataInterface != null}, out=${cdcOutEndpoint != null}, in=${cdcInEndpoint != null}")
+        cdcOutEndpoint?.let { clearEndpointHalt(it) }
+        cdcInEndpoint?.let { clearEndpointHalt(it) }
     }
 
     private fun setCdcLineCoding(controlInterface: UsbInterface, baud: Int, stopBits: Int, parity: Int, dataBits: Int) {
@@ -764,6 +766,20 @@ class DualCameraActivity : AppCompatActivity() {
         if (rts) value = value or 0x02
         // 0x21 = host-to-device | class | interface recipient
         conn.controlTransfer(0x21, 0x22, value, controlInterface.id, null, 0, CDC_TIMEOUT_MS)
+    }
+
+    /**
+     * Clear the endpoint halt feature on a bulk endpoint. This can recover a
+     * CDC data path that has stalled with bulkTransfer returning -1 while the
+     * underlying USB connection is still alive.
+     */
+    private fun clearEndpointHalt(endpoint: UsbEndpoint): Int {
+        val conn = cdcConnection ?: return -1
+        // 0x02 = host-to-device | standard | endpoint recipient
+        // bRequest = USB_REQ_CLEAR_FEATURE (1), wValue = ENDPOINT_HALT (0)
+        val result = conn.controlTransfer(0x02, 1, 0, endpoint.address, null, 0, CDC_TIMEOUT_MS)
+        Log.d(TAG, "Cleared endpoint halt 0x${endpoint.address.toString(16)}: result=$result")
+        return result
     }
 
     private fun releaseCdc() {
@@ -801,7 +817,9 @@ class DualCameraActivity : AppCompatActivity() {
 
         val camera = currentCamera
         val device = currentDevice
-        Log.w(TAG, "RECOVER CAMERA attempt #$recoveryAttempts: camera=${camera != null}, device=${device?.deviceName}, lastFrame=${now - lastFrameTime}ms ago")
+        val usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
+        val usbDevices = usbManager.deviceList.values.map { "${it.deviceName} ${String.format("%04X:%04X", it.vendorId, it.productId)}" }
+        Log.w(TAG, "RECOVER CAMERA attempt #$recoveryAttempts: camera=${camera != null}, device=${device?.deviceName}, lastFrame=${now - lastFrameTime}ms ago, usbDevices=${usbDevices}")
 
         runOnUiThread {
             try {
@@ -2186,6 +2204,11 @@ class DualCameraActivity : AppCompatActivity() {
         val outEp = cdcOutEndpoint ?: throw RuntimeException("CDC OUT endpoint lost")
         val inEp = cdcInEndpoint ?: throw RuntimeException("CDC IN endpoint lost")
 
+        Log.d(TAG, "doSingleCapture: conn=${System.identityHashCode(conn)}, " +
+                "outEp=0x${outEp.address.toString(16)} (max=${outEp.maxPacketSize}), " +
+                "inEp=0x${inEp.address.toString(16)} (max=${inEp.maxPacketSize}), " +
+                "device=${currentDevice?.deviceName}, ctrlBlock=${currentCtrlBlock != null}")
+
         // Drain stale input
         drainStaleInput(conn, inEp)
 
@@ -2194,7 +2217,8 @@ class DualCameraActivity : AppCompatActivity() {
         val written = conn.bulkTransfer(outEp, cmd, cmd.size, CDC_TIMEOUT_MS)
         if (written < 0) {
             Log.e(TAG, "CDC OUT bulkTransfer failed: written=$written, outEp=0x${outEp.address.toString(16)}, " +
-                    "connection=${conn}, device=${currentDevice?.deviceName}")
+                    "conn=${System.identityHashCode(conn)}, ctrlBlock=${currentCtrlBlock != null}, " +
+                    "device=${currentDevice?.deviceName}, lastFrame=${SystemClock.elapsedRealtime() - lastFrameTime}ms ago")
             throw RuntimeException("Failed to send capture command (bulkTransfer returned $written)")
         }
 

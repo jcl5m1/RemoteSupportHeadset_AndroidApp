@@ -92,20 +92,21 @@ class LogcatReader:
         # Clear existing logcat first, then stream new entries.
         subprocess.run(["adb", "logcat", "-c"], capture_output=True)
         cmd = ["adb", "logcat", "-v", "threadtime", "-s", f"{TAG}:V"]
-        self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         if self._proc.stdout is None:
             return
-        for line in self._proc.stdout:
+        for raw in self._proc.stdout:
             if self._stop_event.is_set():
                 break
-            self._parse_line(line.rstrip("\n"))
+            line = raw.decode("utf-8", errors="replace").rstrip("\n")
+            self._parse_line(line)
             # Keep a rolling buffer for stall/failure diagnosis.
             if self.recent_lines.full():
                 try:
                     self.recent_lines.get_nowait()
                 except queue.Empty:
                     pass
-            self.recent_lines.put(line.rstrip("\n"))
+            self.recent_lines.put(line)
 
     def _parse_line(self, line: str) -> None:
         m = START_RE.search(line)
@@ -181,7 +182,10 @@ STALL_RE = re.compile(
     r"Camera health check: no camera open|"
     r"Could not open CDC port"
 )
-HEALTHY_RE = re.compile(r"Camera health check OK|FPS: \d|AprilTag cycle:")
+# Require a non-zero FPS. "FPS: 0" is a common symptom of the Android USB host
+# stack stall where the app believes the camera is open but no frames arrive.
+HEALTHY_FPS_RE = re.compile(r"FPS: ([1-9]\d*)")
+HEALTHY_RE = re.compile(r"Camera health check OK|AprilTag cycle:")
 
 # CDC command failure emitted by DualCameraActivity.doSingleCapture().
 CDC_CMD_FAIL_RE = re.compile(r"Failed to send capture command \(bulkTransfer returned -?\d+\)")
@@ -193,8 +197,15 @@ def is_camera_stalled(log: str) -> bool:
 
 
 def is_camera_healthy(log: str) -> bool:
-    """Return True if the app is receiving preview frames."""
-    return bool(HEALTHY_RE.search(log))
+    """Return True if the app is receiving preview frames.
+
+    A reported FPS of 0 means the SurfaceView callback is running but no UVC
+    frames have been delivered since the camera was (re-)opened. That state is
+    not healthy and will not self-recover without a stronger USB reset.
+    """
+    fps_match = HEALTHY_FPS_RE.search(log)
+    fps_healthy = fps_match is not None and int(fps_match.group(1)) > 0
+    return fps_healthy or bool(HEALTHY_RE.search(log))
 
 
 def has_cdc_command_failure(log: str) -> bool:
@@ -202,15 +213,45 @@ def has_cdc_command_failure(log: str) -> bool:
     return bool(CDC_CMD_FAIL_RE.search(log))
 
 
-def recover_usb_host() -> None:
-    """Reset the Android USB host port via ADB shell (no root required)."""
-    print("  [recover] Resetting Android USB host port...")
+def usb_host_state() -> str:
+    """Return the relevant lines of 'dumpsys usb' for diagnosis."""
     try:
-        adb(["shell", "svc", "usb", "resetUsbPort"], check=False)
+        out = adb(["shell", "dumpsys", "usb"], check=False)
+        # Keep only the handler state block; the full dump is huge.
+        start = out.find("handler={")
+        end = out.find("}", start)
+        if start >= 0 and end >= 0:
+            return out[start:end + 1]
     except Exception as e:
-        print(f"  [recover] resetUsbPort failed: {e}")
-    # Give the host controller time to re-enumerate the attached device.
-    time.sleep(4.0)
+        return f"<error: {e}>"
+    return ""
+
+
+def recover_usb_host(level: int = 1) -> None:
+    """Reset the Android USB host port via ADB shell (no root required).
+
+    level 1: soft reset via svc usb resetUsbPort.
+    level 2: stronger recovery by toggling USB data signals, which power-cycles
+             the host PHY and forces full re-enumeration of the attached device.
+    """
+    print(f"  [recover] USB host state before: {usb_host_state()}")
+    if level == 1:
+        print("  [recover] Resetting Android USB host port (soft)...")
+        try:
+            adb(["shell", "svc", "usb", "resetUsbPort"], check=False)
+        except Exception as e:
+            print(f"  [recover] resetUsbPort failed: {e}")
+        time.sleep(4.0)
+    else:
+        print("  [recover] Toggling Android USB data signals (hard)...")
+        try:
+            adb(["shell", "svc", "usb", "enableUsbDataSignal", "false"], check=False)
+            time.sleep(2.0)
+            adb(["shell", "svc", "usb", "enableUsbDataSignal", "true"], check=False)
+        except Exception as e:
+            print(f"  [recover] enableUsbDataSignal toggle failed: {e}")
+        # Full re-enumeration after a PHY power-cycle can take 5-7 s.
+        time.sleep(7.0)
 
 
 def wait_for_camera_healthy(reader: LogcatReader, timeout: float = 60.0) -> bool:
@@ -224,13 +265,14 @@ def wait_for_camera_healthy(reader: LogcatReader, timeout: float = 60.0) -> bool
 
 
 def ensure_camera_healthy(reader: LogcatReader, recovery_attempts: int = 3) -> bool:
-    """Ensure the camera is streaming, running USB host recovery if needed."""
+    """Ensure the camera is streaming, running progressively stronger recovery."""
     if is_camera_healthy(reader.recent_log()):
         return True
 
     for attempt in range(1, recovery_attempts + 1):
         print(f"  [recover] Camera not healthy (attempt {attempt}/{recovery_attempts})")
-        recover_usb_host()
+        # Escalate: soft reset on first try, hard PHY toggle on subsequent tries.
+        recover_usb_host(level=1 if attempt == 1 else 2)
         if wait_for_camera_healthy(reader, timeout=60.0):
             print("  [recover] Camera healthy again")
             return True
@@ -239,16 +281,22 @@ def ensure_camera_healthy(reader: LogcatReader, recovery_attempts: int = 3) -> b
 
 
 def recover_after_failed_capture(reader: LogcatReader) -> bool:
-    """Reset the Android USB host port after a capture failure and wait for recovery.
+    """Recover after a capture failure and wait for the stream to return.
 
     The preview can remain healthy while the CDC OUT endpoint becomes stale,
     so we always run a host-port reset after a failed capture and then wait for
     both preview and CDC to come back.
     """
     print("  [recover] Capture failed; resetting USB host port...")
-    recover_usb_host()
+    recover_usb_host(level=1)
     if wait_for_camera_healthy(reader, timeout=60.0):
         print("  [recover] Camera/CDC path recovered")
+        return True
+    # If a soft reset was not enough, escalate to a PHY toggle once.
+    print("  [recover] Soft reset insufficient; escalating to PHY toggle...")
+    recover_usb_host(level=2)
+    if wait_for_camera_healthy(reader, timeout=60.0):
+        print("  [recover] Camera/CDC path recovered after PHY toggle")
         return True
     return False
 
