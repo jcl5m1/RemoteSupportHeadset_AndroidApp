@@ -84,7 +84,12 @@ def clear_logcat() -> None:
 def dump_logcat() -> str:
     # Use verbose level so we can see the periodic "Camera health check OK"
     # (verbose) and the "No camera devices initially found" (debug) messages.
-    return adb(["logcat", "-d", "-s", f"{TAG}:V"])
+    try:
+        return adb(["logcat", "-d", "-s", f"{TAG}:V"])
+    except subprocess.CalledProcessError as e:
+        # ADB can briefly drop out after a USB host reset; tolerate it.
+        print(f"  [adb] logcat failed ({e.returncode}), retrying...")
+        return ""
 
 
 def parse_logcat(log: str, events: dict) -> None:
@@ -166,14 +171,8 @@ def recover_usb_host() -> None:
         adb(["shell", "svc", "usb", "resetUsbPort"], check=False)
     except Exception as e:
         print(f"  [recover] resetUsbPort failed: {e}")
-    time.sleep(2.0)
-    try:
-        adb(["shell", "svc", "usb", "enableUsbDataSignal", "false"], check=False)
-        time.sleep(1.0)
-        adb(["shell", "svc", "usb", "enableUsbDataSignal", "true"], check=False)
-    except Exception as e:
-        print(f"  [recover] enableUsbDataSignal toggle failed: {e}")
-    time.sleep(2.0)
+    # Give the host controller time to re-enumerate the attached device.
+    time.sleep(4.0)
 
 
 def wait_for_camera_healthy(timeout: float = 60.0) -> bool:
