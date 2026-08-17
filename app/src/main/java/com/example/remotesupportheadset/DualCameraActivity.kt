@@ -2545,9 +2545,19 @@ class DualCameraActivity : AppCompatActivity() {
                     inJustDecodeBounds = true
                 }
                 BitmapFactory.decodeFile(file.absolutePath, options)
-                val targetWidth = 256
-                val targetHeight = 192
-                val sampleSize = calculateInSampleSize(options.outWidth, options.outHeight, targetWidth, targetHeight)
+                // Preserve the captured image's aspect ratio; the rotated full-res
+                // still is portrait (e.g. 1944x2592), so a fixed 4:3 thumbnail was
+                // stretching it. Use a fixed max height and a proportional width.
+                val maxThumbHeight = 192
+                val srcWidth = options.outWidth
+                val srcHeight = options.outHeight
+                val targetHeight = maxThumbHeight
+                val targetWidth = if (srcHeight > 0) {
+                    (srcWidth * targetHeight / srcHeight.toFloat()).toInt().coerceAtLeast(1)
+                } else {
+                    (targetHeight * 4 / 3f).toInt()
+                }
+                val sampleSize = calculateInSampleSize(srcWidth, srcHeight, targetWidth, targetHeight)
                 val decodeOptions = BitmapFactory.Options().apply {
                     inSampleSize = sampleSize
                 }
