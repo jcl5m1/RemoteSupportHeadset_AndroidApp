@@ -278,6 +278,8 @@ python3 simulate_capture_lifecycle.py --count 3 --zoom
 
 For full histogram data use `--count 100` and omit `--zoom` to exercise the plain capture path. The script prints statistics and, if `matplotlib` is installed, writes a histogram PNG.
 
+The harness treats `FPS > 0` as the health signal, auto-recovers from a stalled Android USB host by escalating from `svc usb resetUsbPort` to `svc usb enableUsbDataSignal false && svc usb enableUsbDataSignal true`, and decodes logcat with replacement characters so binary CDC/UVC traffic cannot crash the reader. A recent run completed 100 randomized captures with 100/100 success and stream-resume.
+
 ## Development conventions
 
 - **Package**: `com.example.remotesupportheadset`.
