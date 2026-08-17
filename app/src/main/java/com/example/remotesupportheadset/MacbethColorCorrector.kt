@@ -201,6 +201,93 @@ object MacbethColorCorrector {
         return out
     }
 
+    /**
+     * Estimate diagonal AWB gains from the white and grey patches of a detected
+     * Macbeth chart. Returns a float array [rGain, gGain, bGain] that can be
+     * passed to [applyAwb], or null if the chart corners are not found.
+     *
+     * This is more robust than a full affine CCM when the image is overexposed,
+     * because it only neutralises the white/grey point rather than fitting all
+     * swatches.
+     */
+    fun estimateAwbGains(
+        bitmap: Bitmap,
+        detections: List<AprilTagDetector.Detection>
+    ): FloatArray? {
+        val tagCenters = detections.map { d ->
+            val cx = d.corners.map { it.first }.average().toFloat()
+            val cy = d.corners.map { it.second }.average().toFloat()
+            d.id to (cx to cy)
+        }.toMap()
+
+        val matchedCharts = mutableMapOf<String, MutableMap<String, Pair<Float, Float>>>()
+        for ((id, center) in tagCenters) {
+            val (chartName, corner) = TAG_TO_LAYOUT[id] ?: continue
+            matchedCharts.getOrPut(chartName) { mutableMapOf() }[corner] = center
+        }
+        Log.d(TAG, "estimateAwbGains: matchedCharts=${matchedCharts.map { it.key to it.value.size }}")
+
+        for ((chartName, observedCorners) in matchedCharts) {
+            val chart = CHARTS.first { it.name == chartName }
+            if (observedCorners.size < 4) continue
+            val homography = estimateHomography(chart, observedCorners) ?: continue
+
+            // Sample the white patch (row 2, col 0) and grey patch (row 2, col 2).
+            val whiteColor = sampleSwatch(bitmap, chart, homography, 2, 0)
+            val greyColor = sampleSwatch(bitmap, chart, homography, 2, 2)
+            Log.d(TAG, "estimateAwbGains: white=$whiteColor grey=$greyColor")
+            if (whiteColor == null && greyColor == null) continue
+
+            val color = whiteColor ?: greyColor!!
+            val r = Color.red(color).toFloat()
+            val g = Color.green(color).toFloat()
+            val b = Color.blue(color).toFloat()
+            if (r <= 0f || g <= 0f || b <= 0f) continue
+
+            // Neutralise the grey/white patch so R == G == B. Keep green at 1.0
+            // and scale red/blue relative to it.
+            val rGain = g / r
+            val bGain = g / b
+            Log.i(TAG, "AWB gains for $chartName: R=$rGain, B=$bGain from color=${String.format("#%06X", 0xFFFFFF and color)}")
+            return floatArrayOf(rGain, 1f, bGain)
+        }
+        return null
+    }
+
+    /**
+     * Apply diagonal AWB gains to every pixel of [bitmap] and return a new bitmap.
+     * [gains] is [rGain, gGain, bGain]. The input bitmap is left untouched.
+     */
+    fun applyAwb(bitmap: Bitmap, gains: FloatArray): Bitmap {
+        val w = bitmap.width
+        val h = bitmap.height
+        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val pixels = IntArray(w * h)
+        bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
+        for (i in pixels.indices) {
+            val c = pixels[i]
+            val r = (Color.red(c) * gains[0]).toInt().coerceIn(0, 255)
+            val g = (Color.green(c) * gains[1]).toInt().coerceIn(0, 255)
+            val b = (Color.blue(c) * gains[2]).toInt().coerceIn(0, 255)
+            pixels[i] = Color.rgb(r, g, b)
+        }
+        out.setPixels(pixels, 0, w, 0, 0, w, h)
+        return out
+    }
+
+    private fun sampleSwatch(
+        bitmap: Bitmap,
+        chart: ChartLayout,
+        homography: Matrix,
+        row: Int,
+        col: Int
+    ): Int? {
+        val (cx, cy) = cellCenter(row, col)
+        val pts = floatArrayOf(cx, cy)
+        homography.mapPoints(pts)
+        return sampleMean(bitmap, pts[0].toInt(), pts[1].toInt(), max(1, CELL / 12))
+    }
+
     private fun estimateHomography(
         chart: ChartLayout,
         observedCorners: Map<String, Pair<Float, Float>>

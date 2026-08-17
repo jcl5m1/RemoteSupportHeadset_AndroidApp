@@ -14,6 +14,7 @@ import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.RectF
 import android.hardware.usb.UsbConstants
@@ -116,6 +117,8 @@ class DualCameraActivity : AppCompatActivity() {
         const val EXTRA_CAPTURE_NOW = "capture_now"
         /** Intent extra that runs the still-capture lifecycle test with the given count. */
         const val EXTRA_LIFECYCLE_TEST_COUNT = "lifecycle_test_count"
+        /** Intent extra that runs capture→zoom→close cycles instead of plain captures. */
+        const val EXTRA_LIFECYCLE_ZOOM_TEST = "lifecycle_zoom_test"
         /** Intent extra that opens the zoom overlay for the last captured image. */
         const val EXTRA_ZOOM_OPEN = "zoom_open"
         /** Intent extra that closes the zoom overlay. */
@@ -528,8 +531,9 @@ class DualCameraActivity : AppCompatActivity() {
         }
         intent?.getIntExtra(EXTRA_LIFECYCLE_TEST_COUNT, 0)?.let { count ->
             if (count > 0) {
-                Log.d(TAG, "EXTRA_LIFECYCLE_TEST_COUNT=$count requested")
-                runLifecycleTest(count)
+                val zoomMode = intent.getBooleanExtra(EXTRA_LIFECYCLE_ZOOM_TEST, false)
+                Log.d(TAG, "EXTRA_LIFECYCLE_TEST_COUNT=$count requested, zoomMode=$zoomMode")
+                runLifecycleTest(count, zoomMode)
             }
         }
 
@@ -866,14 +870,19 @@ class DualCameraActivity : AppCompatActivity() {
      *
      * The test waits for the CDC path to be ready before each capture. If the
      * device resets mid-test, the loop pauses and resumes after reconnection.
+     *
+     * When [zoomMode] is true each iteration performs capture → open zoom → close
+     * zoom with human-like delays, matching the manual tap scenario the user is
+     * trying to stabilise.
      */
-    private fun runLifecycleTest(count: Int) {
+    private fun runLifecycleTest(count: Int, zoomMode: Boolean = false) {
         if (lifecycleTestRunning) return
         lifecycleTestRunning = true
         lifecycleSuccess = 0
         lifecycleFail = 0
-        Toast.makeText(this, "Starting $count capture lifecycle test", Toast.LENGTH_SHORT).show()
-        Log.i(TAG, "Lifecycle test START: count=$count")
+        val modeLabel = if (zoomMode) "capture→zoom→close" else "capture"
+        Toast.makeText(this, "Starting $count $modeLabel lifecycle test", Toast.LENGTH_SHORT).show()
+        Log.i(TAG, "Lifecycle test START: count=$count, zoomMode=$zoomMode")
 
         lifecycleTestThread = Thread {
             val start = SystemClock.elapsedRealtime()
@@ -910,7 +919,23 @@ class DualCameraActivity : AppCompatActivity() {
                         Toast.makeText(this, "Capture $i/$count", Toast.LENGTH_SHORT).show()
                     }
                     val ok = captureStillImageWithRetries(3) { !lifecycleTestRunning }
-                    if (ok) lifecycleSuccess++ else lifecycleFail++
+                    if (ok) {
+                        lifecycleSuccess++
+                        if (zoomMode) {
+                            // Give the thumbnail/generation thread a moment, then open zoom.
+                            Thread.sleep(800)
+                            runOnUiThread {
+                                Toast.makeText(this, "Zoom $i/$count", Toast.LENGTH_SHORT).show()
+                                lastCapturedFile?.let { showZoomOverlay(it) }
+                            }
+                            // Keep the zoom open briefly, then close it.
+                            Thread.sleep(1500)
+                            runOnUiThread { hideZoomOverlay() }
+                            Thread.sleep(500)
+                        }
+                    } else {
+                        lifecycleFail++
+                    }
                     Log.i(TAG, "Lifecycle test progress $i/$count ok=$ok (success=$lifecycleSuccess fail=$lifecycleFail)")
                     if (i < count && lifecycleTestRunning) {
                         Thread.sleep(LIFECYCLE_CAPTURE_INTERVAL_MS)
@@ -2192,6 +2217,9 @@ class DualCameraActivity : AppCompatActivity() {
         if (jpegData.size != stillLen) {
             throw RuntimeException("Incomplete JPEG: got ${jpegData.size}/$stillLen")
         }
+        if (jpegData.size < 2 || jpegData[0] != 0xFF.toByte() || jpegData[1] != 0xD8.toByte()) {
+            throw RuntimeException("Invalid JPEG magic: ${jpegData.take(2).map { "%02X".format(it) }}")
+        }
 
         // Consume the trailing \r\nSTILL_END\r\n marker (skip any empty lines
         // that may have arrived with the final payload chunk).
@@ -2362,8 +2390,8 @@ class DualCameraActivity : AppCompatActivity() {
             exif.setAttribute(ExifInterface.TAG_DATETIME, dateTime)
             exif.setAttribute(ExifInterface.TAG_DATETIME_ORIGINAL, dateTime)
             exif.setAttribute(ExifInterface.TAG_DATETIME_DIGITIZED, dateTime)
-            // The still image is rotated 90° counter-clockwise in
-            // correctFullResJpeg() so the EXIF orientation is normal.
+            // correctFullResJpeg() rotates the still image 90° counter-clockwise
+            // and applies AWB from the Macbeth chart, so EXIF orientation is normal.
             exif.setAttribute(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL.toString())
 
             getCurrentLocation()?.let { loc ->
@@ -2386,7 +2414,9 @@ class DualCameraActivity : AppCompatActivity() {
     }
 
     private fun saveJpeg(data: ByteArray): File {
-        val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        // Include millisecond precision so rapid captures (and the lifecycle test)
+        // never collide on the same filename.
+        val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
         val picturesDir = getExternalFilesDir(Environment.DIRECTORY_PICTURES)
             ?: File(filesDir, "Pictures")
         val appDir = File(picturesDir, "RemoteSupportHeadset")
@@ -2395,9 +2425,8 @@ class DualCameraActivity : AppCompatActivity() {
 
         FileOutputStream(file).use { it.write(data) }
 
-        // The firmware's full-resolution DVP output is currently upside-down
-        // relative to the upright live preview. Rotate it and apply the active
-        // colour-correction matrix if one has been computed from a Macbeth chart.
+        // Rotate the full-resolution still to upright and apply AWB/colour
+        // correction derived from the Macbeth chart.
         correctFullResJpeg(file)
 
         writeJpegMetadata(file)
@@ -2408,10 +2437,11 @@ class DualCameraActivity : AppCompatActivity() {
     }
 
     /**
-     * Decode the freshly saved full-resolution JPEG and rotate it 90°
-     * counter-clockwise so the chart/text in the mechanically rotated camera
-     * appears upright. The file is overwritten with the rotated image. Large
-     * images (>24 MP) are skipped to avoid OOM.
+     * Decode the freshly saved full-resolution JPEG, rotate it 90°
+     * counter-clockwise, and apply AWB / colour correction derived from the
+     * Macbeth chart when all four 4x6 corner tags are detected. The file is
+     * overwritten with the processed image. Large images (>24 MP) are skipped to
+     * avoid OOM.
      */
     private fun correctFullResJpeg(file: File) {
         try {
@@ -2420,13 +2450,13 @@ class DualCameraActivity : AppCompatActivity() {
             val width = bounds.outWidth
             val height = bounds.outHeight
             if (width <= 0 || height <= 0) {
-                Log.w(TAG, "Cannot rotate ${file.name}: invalid dimensions")
+                Log.w(TAG, "Cannot process ${file.name}: invalid dimensions")
                 return
             }
 
             val megapixels = (width.toLong() * height.toLong()) / 1_000_000.0
             if (megapixels > 24) {
-                Log.w(TAG, "Skipping rotation for ${file.name}: ${"%.1f".format(megapixels)}MP is too large")
+                Log.w(TAG, "Skipping processing for ${file.name}: ${"%.1f".format(megapixels)}MP is too large")
                 return
             }
 
@@ -2435,23 +2465,72 @@ class DualCameraActivity : AppCompatActivity() {
             }
             val original = BitmapFactory.decodeFile(file.absolutePath, decodeOptions)
                 ?: run {
-                    Log.w(TAG, "Failed to decode ${file.name} for rotation")
+                    Log.w(TAG, "Failed to decode ${file.name} for processing")
                     return
                 }
 
             val rotated = rotateBitmap90Ccw(original)
             original.recycle()
 
-            FileOutputStream(file).use { out ->
-                rotated.compress(Bitmap.CompressFormat.JPEG, 95, out)
+            // Detect the 4x6 Macbeth chart in the upright rotated image and apply
+            // a diagonal AWB correction from its white/grey patch.
+            var awbApplied = false
+            val processed = try {
+                val detections = detectMacbeth4x6(rotated)
+                val gains = if (detections.size >= 4) {
+                    MacbethColorCorrector.estimateAwbGains(rotated, detections)
+                } else null
+                if (gains != null && gains.all { it in 0.2f..5f }) {
+                    val corrected = MacbethColorCorrector.applyAwb(rotated, gains)
+                    rotated.recycle()
+                    awbApplied = true
+                    Log.i(TAG, "Applied AWB to ${file.name}: gains=${gains.contentToString()}")
+                    corrected
+                } else {
+                    if (gains != null) {
+                        Log.w(TAG, "AWB gains out of range for ${file.name}: ${gains.contentToString()}")
+                    }
+                    rotated
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "AWB processing failed for ${file.name}", e)
+                rotated
             }
-            rotated.recycle()
-            Log.i(TAG, "Rotated full-resolution ${file.name}: ${width}x${height} -> ${rotated.width}x${rotated.height}")
+
+            // Write to a temporary file first so a crash/OOM mid-compress does not
+            // leave the original capture truncated or corrupted.
+            val tempFile = File(file.parent, "${file.name}.tmp")
+            FileOutputStream(tempFile).use { out ->
+                processed.compress(Bitmap.CompressFormat.JPEG, 95, out)
+            }
+            processed.recycle()
+            if (!tempFile.renameTo(file)) {
+                tempFile.delete()
+                throw RuntimeException("Failed to replace ${file.name} with processed version")
+            }
+            Log.i(TAG, "Processed full-resolution ${file.name}: ${width}x${height} -> ${processed.width}x${processed.height}, awbApplied=$awbApplied")
         } catch (e: OutOfMemoryError) {
-            Log.e(TAG, "Out of memory rotating ${file.name}", e)
+            Log.e(TAG, "Out of memory processing ${file.name}", e)
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to rotate ${file.name}", e)
+            Log.e(TAG, "Failed to process ${file.name}", e)
         }
+    }
+
+    /**
+     * Detect the 4x6 Macbeth chart corner tags (16-19) in a full-resolution
+     * image. Try a fast scaled detection first, then fall back to the native
+     * resolution if corners are missing.
+     */
+    private fun detectMacbeth4x6(bitmap: Bitmap): List<AprilTagDetector.Detection> {
+        val chartIds = setOf(16, 17, 18, 19)
+        for (maxDim in listOf(1280, 1920, null)) {
+            val (detections, _) = aprilTagDetector.detect(bitmap, annotate = false, maxDimension = maxDim)
+            val chartDetections = detections.filter { it.id in chartIds }
+            val uniqueIds = chartDetections.map { it.id }.distinct()
+            Log.d(TAG, "detectMacbeth4x6: maxDim=$maxDim found $uniqueIds")
+            if (uniqueIds.size >= 4) return chartDetections
+        }
+        return emptyList()
     }
 
     private fun rotateBitmap90Ccw(bitmap: Bitmap): Bitmap {

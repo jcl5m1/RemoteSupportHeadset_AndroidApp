@@ -38,3 +38,6 @@ google-services.json
 
 # Android Profiling
 *.hprof
+
+# Local test / debug captures pulled from device
+pulled_images/
