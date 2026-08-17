@@ -115,6 +115,8 @@ class DualCameraActivity : AppCompatActivity() {
         const val EXTRA_FIRMWARE_URL = "firmware_url"
         /** Intent extra that triggers a single still capture immediately. */
         const val EXTRA_CAPTURE_NOW = "capture_now"
+        /** Intent extra that tags a simulated capture event with an index for timing stats. */
+        const val EXTRA_SIMULATED_CAPTURE_INDEX = "simulated_capture_index"
         /** Intent extra that runs the still-capture lifecycle test with the given count. */
         const val EXTRA_LIFECYCLE_TEST_COUNT = "lifecycle_test_count"
         /** Intent extra that runs capture→zoom→close cycles instead of plain captures. */
@@ -170,6 +172,13 @@ class DualCameraActivity : AppCompatActivity() {
     private var lifecycleSuccess = 0
     private var lifecycleFail = 0
     private var lifecycleTestThread: Thread? = null
+
+    // Simulated capture timing instrumentation.
+    // When the host drives captures via ADB intents, these track the index and
+    // timestamps so the host can histogram tap→complete and tap→resume times.
+    private var simulatedCaptureIndex = -1
+    private var simulatedCaptureStartTime = 0L
+    private var waitingForStreamResume = false
 
     private var lastCaptureAttemptTime = 0L
 
@@ -401,6 +410,18 @@ class DualCameraActivity : AppCompatActivity() {
         override fun onPreviewData(data: ByteArray?, format: IPreviewDataCallBack.DataFormat) {
             frameCount.incrementAndGet()
             lastFrameTime = SystemClock.elapsedRealtime()
+
+            // If we are waiting for the first preview frame after a simulated
+            // capture, log the stream-resume time.
+            if (waitingForStreamResume) {
+                val idx = simulatedCaptureIndex
+                if (idx >= 0 && simulatedCaptureStartTime > 0L) {
+                    val elapsed = SystemClock.elapsedRealtime() - simulatedCaptureStartTime
+                    Log.i(TAG, "SIMCAP resumed i=$idx t=${SystemClock.elapsedRealtime()} dt_resume=${elapsed}ms")
+                }
+                waitingForStreamResume = false
+            }
+
             val previewSize = currentCamera?.getPreviewSize()
             if (data != null && previewSize != null) {
                 previewFrameWidth = previewSize.width
@@ -512,39 +533,10 @@ class DualCameraActivity : AppCompatActivity() {
 
         checkAndRequestPermissions()
 
-        // Allow an external caller (e.g. adb from a MacBook) to start flashing
-        // immediately without tapping the on-screen Flash button or confirming.
-        val initialFirmwareUrl = intent?.getStringExtra(EXTRA_FIRMWARE_URL)
-        if (initialFirmwareUrl != null) {
-            val skipConfirmation = intent.getBooleanExtra(EXTRA_FLASH_NOW, false)
-            Log.d(TAG, "EXTRA_FIRMWARE_URL=$initialFirmwareUrl, flash_now=$skipConfirmation")
-            downloadFirmwareFromUrl(initialFirmwareUrl, skipConfirmation)
-        } else if (intent?.getBooleanExtra(EXTRA_FLASH_NOW, false) == true) {
-            Log.d(TAG, "EXTRA_FLASH_NOW requested, starting flash flow without confirmation")
-            startFirmwareFlashFlow(skipConfirmation = true)
-        }
-
-        // Allow external callers to trigger capture or a lifecycle stress test.
-        if (intent?.getBooleanExtra(EXTRA_CAPTURE_NOW, false) == true) {
-            Log.d(TAG, "EXTRA_CAPTURE_NOW requested")
-            captureStillImage()
-        }
-        intent?.getIntExtra(EXTRA_LIFECYCLE_TEST_COUNT, 0)?.let { count ->
-            if (count > 0) {
-                val zoomMode = intent.getBooleanExtra(EXTRA_LIFECYCLE_ZOOM_TEST, false)
-                Log.d(TAG, "EXTRA_LIFECYCLE_TEST_COUNT=$count requested, zoomMode=$zoomMode")
-                runLifecycleTest(count, zoomMode)
-            }
-        }
-
-        if (intent?.getBooleanExtra(EXTRA_ZOOM_OPEN, false) == true) {
-            Log.d(TAG, "EXTRA_ZOOM_OPEN requested")
-            lastCapturedFile?.let { showZoomOverlay(it) }
-        }
-        if (intent?.getBooleanExtra(EXTRA_ZOOM_CLOSE, false) == true) {
-            Log.d(TAG, "EXTRA_ZOOM_CLOSE requested")
-            hideZoomOverlay()
-        }
+        // Allow an external caller (e.g. adb from a MacBook) to start flashing,
+        // capture, zoom, or lifecycle tests via intent extras.  [onNewIntent]
+        // handles the same extras when the activity is already running.
+        handleIntentActions(intent)
 
     }
 
@@ -847,8 +839,11 @@ class DualCameraActivity : AppCompatActivity() {
     /**
      * User-facing single still capture. Debounced so rapid taps don't queue
      * overlapping captures.
+     *
+     * @param simulatedIndex If non-negative, the capture is tagged as a simulated
+     *   tap from the host stress-test script and timing statistics are emitted.
      */
-    private fun captureStillImage() {
+    private fun captureStillImage(simulatedIndex: Int = -1) {
         val now = SystemClock.elapsedRealtime()
         if (now - lastCaptureAttemptTime < CAPTURE_DEBOUNCE_MS) {
             Log.d(TAG, "Capture debounced")
@@ -861,7 +856,19 @@ class DualCameraActivity : AppCompatActivity() {
             return
         }
 
-        Thread { captureStillImageWithRetries(3) }.apply { name = "StillCaptureThread"; start() }
+        if (simulatedIndex >= 0) {
+            simulatedCaptureIndex = simulatedIndex
+            simulatedCaptureStartTime = SystemClock.elapsedRealtime()
+            waitingForStreamResume = false
+            // Do not set waitingForStreamResume=true here; the preview callback may
+            // still receive frames for a short time before the firmware pauses
+            // the stream for the still capture. We mark the resume-wait only
+            // after the capture session ends (see captureStillImageWithRetries).
+            Log.i(TAG, "SIMCAP start i=$simulatedIndex t=${simulatedCaptureStartTime}")
+        }
+
+        Thread { captureStillImageWithRetries(3, simulatedIndex = simulatedIndex) }
+            .apply { name = "StillCaptureThread"; start() }
     }
 
     /**
@@ -918,7 +925,7 @@ class DualCameraActivity : AppCompatActivity() {
                     runOnUiThread {
                         Toast.makeText(this, "Capture $i/$count", Toast.LENGTH_SHORT).show()
                     }
-                    val ok = captureStillImageWithRetries(3) { !lifecycleTestRunning }
+                    val ok = captureStillImageWithRetries(3, cancelCheck = { !lifecycleTestRunning })
                     if (ok) {
                         lifecycleSuccess++
                         if (zoomMode) {
@@ -2096,8 +2103,15 @@ class DualCameraActivity : AppCompatActivity() {
     /**
      * Capture one still image, retrying up to [maxRetries] times if the CDC
      * path returns an error. Returns true if a JPEG was saved.
+     *
+     * @param simulatedIndex If non-negative, timing statistics for the host
+     *   stress-test script are emitted when the capture completes or fails.
      */
-    private fun captureStillImageWithRetries(maxRetries: Int, cancelCheck: () -> Boolean = { false }): Boolean {
+    private fun captureStillImageWithRetries(
+        maxRetries: Int,
+        cancelCheck: () -> Boolean = { false },
+        simulatedIndex: Int = -1
+    ): Boolean {
         captureLock.lock()
         try {
             if (isCapturing) {
@@ -2146,6 +2160,15 @@ class DualCameraActivity : AppCompatActivity() {
             isCapturing = false
             lastCaptureEndTime = SystemClock.elapsedRealtime()
             captureLock.unlock()
+            val idx = simulatedIndex
+            if (idx >= 0) {
+                val elapsed = SystemClock.elapsedRealtime() - simulatedCaptureStartTime
+                Log.i(TAG, "SIMCAP complete i=$idx t=${SystemClock.elapsedRealtime()} dt_complete=${elapsed}ms success=$succeeded")
+                // The firmware pauses the UVC preview during the still capture.
+                // Start watching for the first preview frame after this point so
+                // we can measure tap-to-stream-resume time accurately.
+                waitingForStreamResume = true
+            }
             Log.d(TAG, "Capture session ended, success=$succeeded")
         }
 
@@ -3355,32 +3378,46 @@ class DualCameraActivity : AppCompatActivity() {
 
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
-        val firmwareUrl = intent?.getStringExtra(EXTRA_FIRMWARE_URL)
+        Log.d(TAG, "onNewIntent: $intent")
+        handleIntentActions(intent)
+    }
+
+    /**
+     * Handle intent extras that trigger captures, zoom, or lifecycle tests.
+     * Called from both [onCreate] (first launch) and [onNewIntent] (subsequent
+     * intents while the activity is already running, e.g. repeated ADB taps).
+     */
+    private fun handleIntentActions(intent: Intent?) {
+        intent ?: return
+        val firmwareUrl = intent.getStringExtra(EXTRA_FIRMWARE_URL)
         if (firmwareUrl != null) {
             val skipConfirmation = intent.getBooleanExtra(EXTRA_FLASH_NOW, false)
-            Log.d(TAG, "onNewIntent: EXTRA_FIRMWARE_URL=$firmwareUrl, flash_now=$skipConfirmation")
+            Log.d(TAG, "EXTRA_FIRMWARE_URL=$firmwareUrl, flash_now=$skipConfirmation")
             downloadFirmwareFromUrl(firmwareUrl, skipConfirmation)
-        } else if (intent?.getBooleanExtra(EXTRA_FLASH_NOW, false) == true) {
-            Log.d(TAG, "onNewIntent: EXTRA_FLASH_NOW requested, starting flash flow without confirmation")
+        } else if (intent.getBooleanExtra(EXTRA_FLASH_NOW, false)) {
+            Log.d(TAG, "EXTRA_FLASH_NOW requested, starting flash flow without confirmation")
             startFirmwareFlashFlow(skipConfirmation = true)
         }
 
-        if (intent?.getBooleanExtra(EXTRA_CAPTURE_NOW, false) == true) {
-            Log.d(TAG, "onNewIntent: EXTRA_CAPTURE_NOW requested")
-            captureStillImage()
+        if (intent.getBooleanExtra(EXTRA_CAPTURE_NOW, false)) {
+            val idx = intent.getIntExtra(EXTRA_SIMULATED_CAPTURE_INDEX, -1)
+            Log.d(TAG, "EXTRA_CAPTURE_NOW requested, simulatedIndex=$idx")
+            captureStillImage(simulatedIndex = idx)
         }
-        intent?.getIntExtra(EXTRA_LIFECYCLE_TEST_COUNT, 0)?.let { count ->
+        intent.getIntExtra(EXTRA_LIFECYCLE_TEST_COUNT, 0).let { count ->
             if (count > 0) {
-                Log.d(TAG, "onNewIntent: EXTRA_LIFECYCLE_TEST_COUNT=$count requested")
-                runLifecycleTest(count)
+                val zoomMode = intent.getBooleanExtra(EXTRA_LIFECYCLE_ZOOM_TEST, false)
+                Log.d(TAG, "EXTRA_LIFECYCLE_TEST_COUNT=$count requested, zoomMode=$zoomMode")
+                runLifecycleTest(count, zoomMode)
             }
         }
-        if (intent?.getBooleanExtra(EXTRA_ZOOM_OPEN, false) == true) {
-            Log.d(TAG, "onNewIntent: EXTRA_ZOOM_OPEN requested")
+
+        if (intent.getBooleanExtra(EXTRA_ZOOM_OPEN, false)) {
+            Log.d(TAG, "EXTRA_ZOOM_OPEN requested")
             lastCapturedFile?.let { showZoomOverlay(it) }
         }
-        if (intent?.getBooleanExtra(EXTRA_ZOOM_CLOSE, false) == true) {
-            Log.d(TAG, "onNewIntent: EXTRA_ZOOM_CLOSE requested")
+        if (intent.getBooleanExtra(EXTRA_ZOOM_CLOSE, false)) {
+            Log.d(TAG, "EXTRA_ZOOM_CLOSE requested")
             hideZoomOverlay()
         }
     }

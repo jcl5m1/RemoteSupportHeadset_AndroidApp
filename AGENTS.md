@@ -142,10 +142,13 @@ You can also open the project in Android Studio and let it sync Gradle automatic
 
 ### Agent build/deploy environment
 
+> **All build and deploy tools are present.** This workspace has a working JDK, Android SDK, NDK, Gradle wrapper, and ADB. Do not claim that the JDK or Android SDK is missing — use the paths below if a command fails for an unrelated reason.
+
 The agent environment in this workspace is set up to build and deploy the Android app directly. All required tools (JDK, Android SDK, ADB) are installed and available, so agents can and should build, install, and restart the app without claiming any are missing.
 
 - **JDK**: OpenJDK 26 is installed via Homebrew. `JAVA_HOME` is exported in `~/.zshrc`, `~/.bash_profile`, and `~/.bashrc` pointing to the stable Homebrew symlink `/opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home`, which tracks version updates. `java` and `javac` are also symlinked into `~/.local/bin` so they are on `PATH` even for non-interactive shells, and `org.gradle.java.home` is set in `gradle.properties` as a fallback.
 - **Android SDK**: Command-line tools are installed at `/opt/homebrew/share/android-commandlinetools` and referenced by `local.properties` (`sdk.dir=...`).
+- **NDK**: The Android NDK required by the CMake build is bundled with the command-line tools / SDK and referenced via `ndkVersion` in `app/build.gradle`.
 - **ADB**: `adb` is on `PATH` at `/opt/homebrew/bin/adb`; one or more physical devices are normally attached over ADB.
 
 So the full build-and-install flow can be run by the agent without opening Android Studio and without manually exporting `JAVA_HOME`:
@@ -153,6 +156,8 @@ So the full build-and-install flow can be run by the agent without opening Andro
 ```bash
 ./gradlew installDebug
 ```
+
+The same environment can also build the sibling ESP32-P4 firmware in `../esp32-wearable/esp32-p4-wearable/` and deploy it through the Android app.
 
 ### Build configuration notes
 
@@ -252,6 +257,27 @@ Run tests with:
 
 There are currently no instrumented/Android tests (`androidTest` source set does not exist).
 
+### Automated capture-lifecycle stress test
+
+`scripts/simulate_capture_lifecycle.py` drives the app through repeated still-capture life cycles using ADB intents. It records:
+
+- tap-to-capture-complete time,
+- tap-to-live-stream-resume time,
+- inter-capture wait interval,
+- success/failure counts.
+
+Run a small smoke test (create the venv first):
+
+```bash
+cd scripts
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python3 simulate_capture_lifecycle.py --count 3 --zoom
+```
+
+For full histogram data use `--count 100` and omit `--zoom` to exercise the plain capture path. The script prints statistics and, if `matplotlib` is installed, writes a histogram PNG.
+
 ## Development conventions
 
 - **Package**: `com.example.remotesupportheadset`.
@@ -290,3 +316,4 @@ There is no CI/CD pipeline, signing config, or app store deployment script in th
 - `test.gradle` is applied but empty. It is safe to add future test-only dependencies or configuration there.
 - `app/classes.txt` is a manually maintained inventory of resolved AAR/JAR dependencies; it is not used by the build. Update it if you want to keep it accurate.
 - CDC still-capture reliability depends on small (4 KiB) bulk reads and correct handling of the `STILL_END` trailer. Large single-request bulk transfers can leave the final bytes behind on this host/device pair.
+- If a firmware flash fails part-way through, the ESP32 may remain in ROM download mode (USB VID/PID `303a:0012`) and will not enumerate as a UVC+CDC device. When `adb shell dumpsys usb` shows `kernel_state=DISCONNECTED` and no `/sys/bus/usb/devices/*/idVendor` appears after reconnecting, press the **RST/RESET** button on the ESP32-P4 board to reboot into the application firmware (PID `0x4022`).
