@@ -2362,6 +2362,8 @@ class DualCameraActivity : AppCompatActivity() {
             exif.setAttribute(ExifInterface.TAG_DATETIME, dateTime)
             exif.setAttribute(ExifInterface.TAG_DATETIME_ORIGINAL, dateTime)
             exif.setAttribute(ExifInterface.TAG_DATETIME_DIGITIZED, dateTime)
+            // Pixels are rotated to upright in rotateAndCorrectFullResJpeg().
+            exif.setAttribute(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL.toString())
 
             getCurrentLocation()?.let { loc ->
                 exif.setAttribute(ExifInterface.TAG_GPS_LATITUDE, locationValueToExifRational(loc.latitude))
@@ -2390,15 +2392,77 @@ class DualCameraActivity : AppCompatActivity() {
         if (!appDir.exists()) appDir.mkdirs()
         val file = File(appDir, "IMG_$timeStamp.jpg")
 
-        /* The firmware now applies horizontal+vertical flip in full-resolution
-         * DVP mode, so the JPEG from the camera is already upright. */
         FileOutputStream(file).use { it.write(data) }
+
+        // The firmware's full-resolution DVP output is currently upside-down
+        // relative to the upright live preview. Rotate it and apply the active
+        // colour-correction matrix if one has been computed from a Macbeth chart.
+        rotateAndCorrectFullResJpeg(file)
 
         writeJpegMetadata(file)
         MediaScannerConnection.scanFile(this, arrayOf(file.absolutePath), arrayOf("image/jpeg"), null)
         lastCapturedFile = file
         generateThumbnailAsync(file)
         return file
+    }
+
+    /**
+     * Decode a freshly saved full-resolution JPEG, rotate it 180° to match the
+     * upright preview, and apply the active CCM. The file is overwritten with
+     * the processed image. Large images (>24 MP) are skipped to avoid OOM.
+     */
+    private fun rotateAndCorrectFullResJpeg(file: File) {
+        try {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(file.absolutePath, bounds)
+            val width = bounds.outWidth
+            val height = bounds.outHeight
+            if (width <= 0 || height <= 0) {
+                Log.w(TAG, "Cannot rotate/correct ${file.name}: invalid dimensions")
+                return
+            }
+
+            val megapixels = (width.toLong() * height.toLong()) / 1_000_000.0
+            if (megapixels > 24) {
+                Log.w(TAG, "Skipping rotation/CCM for ${file.name}: ${"%.1f".format(megapixels)}MP is too large")
+                return
+            }
+
+            val decodeOptions = BitmapFactory.Options().apply {
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+            val original = BitmapFactory.decodeFile(file.absolutePath, decodeOptions)
+                ?: run {
+                    Log.w(TAG, "Failed to decode ${file.name} for rotation")
+                    return
+                }
+
+            val rotated = rotateBitmap180(original)
+            original.recycle()
+
+            val corrected = if (colorCorrectionEnabled && colorCorrectionMatrix != null) {
+                val applied = MacbethColorCorrector.applyCcm(rotated, colorCorrectionMatrix!!)
+                rotated.recycle()
+                applied
+            } else {
+                rotated
+            }
+
+            FileOutputStream(file).use { out ->
+                corrected.compress(Bitmap.CompressFormat.JPEG, 95, out)
+            }
+            corrected.recycle()
+            Log.i(TAG, "Processed full-resolution ${file.name}: ${width}x${height}, ccmApplied=${colorCorrectionEnabled}")
+        } catch (e: OutOfMemoryError) {
+            Log.e(TAG, "Out of memory rotating/correcting ${file.name}", e)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to rotate/correct ${file.name}", e)
+        }
+    }
+
+    private fun rotateBitmap180(bitmap: Bitmap): Bitmap {
+        val matrix = Matrix().apply { postRotate(180f) }
+        return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
     }
 
     private fun generateThumbnailAsync(file: File) {
