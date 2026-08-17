@@ -100,6 +100,7 @@ class DualCameraActivity : AppCompatActivity() {
         private const val DEVICE_POLL_INTERVAL_MS = 1500L
         private const val CAMERA_HEALTH_CHECK_INTERVAL_MS = 1000L
         private const val CAMERA_FRAME_TIMEOUT_MS = 4000L
+        private const val CAPTURE_GRACE_PERIOD_MS = 15000L
         private const val FIRMWARE_VERSION_INTERVAL_MS = 5000L
 
         private const val ACTION_USB_FLASH_PERMISSION = "com.example.remotesupportheadset.USB_FLASH_PERMISSION"
@@ -159,6 +160,7 @@ class DualCameraActivity : AppCompatActivity() {
     private var cdcInEndpoint: UsbEndpoint? = null
     private val captureLock = ReentrantLock()
     private var isCapturing = false
+    private var lastCaptureEndTime = 0L
 
     // Lifecycle / stress-test state
     private var lifecycleTestRunning = false
@@ -357,6 +359,11 @@ class DualCameraActivity : AppCompatActivity() {
      * Watchdog that verifies preview frames keep arriving. If frames stop for
      * longer than [CAMERA_FRAME_TIMEOUT_MS] the camera stack is considered dead
      * and [recoverCamera] is triggered.
+     *
+     * The check is deferred during a still capture and for [CAPTURE_GRACE_PERIOD_MS]
+     * afterwards, because the firmware pauses the UVC preview stream while it
+     * captures and transfers the full-resolution JPEG. Triggering recovery during
+     * that window aborts the capture and can leave the USB stack in a bad state.
      */
     private val cameraHealthCheckRunnable = object : Runnable {
         override fun run() {
@@ -364,15 +371,21 @@ class DualCameraActivity : AppCompatActivity() {
             val camera = currentCamera
             val now = SystemClock.elapsedRealtime()
             if (camera != null) {
-                val sinceLastFrame = now - lastFrameTime
-                val sinceOpen = now - cameraOpenedTime
-                val framesStopped = lastFrameTime > 0 && sinceLastFrame > CAMERA_FRAME_TIMEOUT_MS
-                val neverDeliveredFrames = lastFrameTime == 0L && cameraOpenedTime > 0 && sinceOpen > CAMERA_FRAME_TIMEOUT_MS
-                if (framesStopped || neverDeliveredFrames) {
-                    Log.w(TAG, "Camera health check FAILED: framesStopped=$framesStopped, neverDeliveredFrames=$neverDeliveredFrames, sinceLastFrame=$sinceLastFrame, sinceOpen=$sinceOpen")
-                    recoverCamera()
+                val sinceLastCapture = now - lastCaptureEndTime
+                val inCaptureGracePeriod = isCapturing || (lastCaptureEndTime > 0 && sinceLastCapture < CAPTURE_GRACE_PERIOD_MS)
+                if (inCaptureGracePeriod) {
+                    Log.v(TAG, "Camera health check deferred: isCapturing=$isCapturing, sinceLastCapture=${sinceLastCapture}ms")
                 } else {
-                    Log.v(TAG, "Camera health check OK: sinceLastFrame=$sinceLastFrame, sinceOpen=$sinceOpen")
+                    val sinceLastFrame = now - lastFrameTime
+                    val sinceOpen = now - cameraOpenedTime
+                    val framesStopped = lastFrameTime > 0 && sinceLastFrame > CAMERA_FRAME_TIMEOUT_MS
+                    val neverDeliveredFrames = lastFrameTime == 0L && cameraOpenedTime > 0 && sinceOpen > CAMERA_FRAME_TIMEOUT_MS
+                    if (framesStopped || neverDeliveredFrames) {
+                        Log.w(TAG, "Camera health check FAILED: framesStopped=$framesStopped, neverDeliveredFrames=$neverDeliveredFrames, sinceLastFrame=$sinceLastFrame, sinceOpen=$sinceOpen")
+                        recoverCamera()
+                    } else {
+                        Log.v(TAG, "Camera health check OK: sinceLastFrame=$sinceLastFrame, sinceOpen=$sinceOpen")
+                    }
                 }
             } else {
                 Log.v(TAG, "Camera health check: no camera open")
@@ -2106,7 +2119,9 @@ class DualCameraActivity : AppCompatActivity() {
         } finally {
             captureLock.lock()
             isCapturing = false
+            lastCaptureEndTime = SystemClock.elapsedRealtime()
             captureLock.unlock()
+            Log.d(TAG, "Capture session ended, success=$succeeded")
         }
 
         if (!succeeded) {
