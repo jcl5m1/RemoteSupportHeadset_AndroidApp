@@ -238,18 +238,17 @@ def ensure_camera_healthy(reader: LogcatReader, recovery_attempts: int = 3) -> b
     return False
 
 
-def recover_from_cdc_failure(reader: LogcatReader) -> bool:
-    """If a CDC command failure is present, reset the Android USB host port.
+def recover_after_failed_capture(reader: LogcatReader) -> bool:
+    """Reset the Android USB host port after a capture failure and wait for recovery.
 
     The preview can remain healthy while the CDC OUT endpoint becomes stale,
-    so this checks the failure pattern explicitly and only then runs recovery.
+    so we always run a host-port reset after a failed capture and then wait for
+    both preview and CDC to come back.
     """
-    if not has_cdc_command_failure(reader.recent_log()):
-        return False
-    print("  [recover] Detected CDC command failure, resetting USB host port...")
+    print("  [recover] Capture failed; resetting USB host port...")
     recover_usb_host()
     if wait_for_camera_healthy(reader, timeout=60.0):
-        print("  [recover] CDC path recovered (camera healthy)")
+        print("  [recover] Camera/CDC path recovered")
         return True
     return False
 
@@ -304,7 +303,7 @@ def main() -> int:
         # Before each tap, make sure both preview and CDC are usable.  The CDC
         # command path can die while the MJPEG preview keeps running.
         if i > 0:
-            if not ensure_camera_healthy(reader) and not recover_from_cdc_failure(reader):
+            if not ensure_camera_healthy(reader) and not recover_after_failed_capture(reader):
                 print(f"ERROR: Camera/CDC did not recover before tap {i}; aborting.")
                 reader.stop()
                 return 1
@@ -335,10 +334,10 @@ def main() -> int:
             print(f"  complete={ev.complete_dt_ms}ms resume={ev.resumed_dt_ms}ms success={ev.complete_success}")
 
         # A failed capture often leaves the CDC OUT endpoint stale even though
-        # the MJPEG preview continues.  Detect that specific failure pattern and
-        # reset the Android USB host port before the next tap.
+        # the MJPEG preview continues.  Reset the Android USB host port and wait
+        # for the camera/CDC path to come back before the next tap.
         if i < args.count - 1 and ev and not ev.complete_success:
-            if not recover_from_cdc_failure(reader):
+            if not recover_after_failed_capture(reader):
                 print(f"ERROR: CDC path did not recover after failed capture {i}; aborting.")
                 reader.stop()
                 return 1
