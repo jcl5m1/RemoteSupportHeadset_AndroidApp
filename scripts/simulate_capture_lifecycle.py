@@ -19,14 +19,16 @@ Usage:
 
 import argparse
 import os
+import queue
 import random
 import re
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 # Force unbuffered output so progress is visible through tee/pipes.
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
@@ -62,6 +64,92 @@ class Event:
     wait_before_next_s: Optional[float]
 
 
+class LogcatReader:
+    """Stream ADB logcat in a background thread and expose parsed events."""
+
+    def __init__(self) -> None:
+        self.events: Dict[int, Event] = {}
+        self.recent_lines: queue.Queue[str] = queue.Queue(maxsize=10000)
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._proc: Optional[subprocess.Popen] = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._reader_loop, name="LogcatReader", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._proc is not None:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+    def _reader_loop(self) -> None:
+        # Clear existing logcat first, then stream new entries.
+        subprocess.run(["adb", "logcat", "-c"], capture_output=True)
+        cmd = ["adb", "logcat", "-v", "threadtime", "-s", f"{TAG}:V"]
+        self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if self._proc.stdout is None:
+            return
+        for line in self._proc.stdout:
+            if self._stop_event.is_set():
+                break
+            self._parse_line(line.rstrip("\n"))
+            # Keep a rolling buffer for stall/failure diagnosis.
+            if self.recent_lines.full():
+                try:
+                    self.recent_lines.get_nowait()
+                except queue.Empty:
+                    pass
+            self.recent_lines.put(line.rstrip("\n"))
+
+    def _parse_line(self, line: str) -> None:
+        m = START_RE.search(line)
+        if m:
+            idx = int(m.group(1))
+            self.events[idx] = Event(
+                index=idx,
+                start_ms=int(m.group(2)),
+                complete_ms=None,
+                complete_dt_ms=None,
+                complete_success=None,
+                resumed_ms=None,
+                resumed_dt_ms=None,
+                wait_before_next_s=None,
+            )
+            return
+        m = COMPLETE_RE.search(line)
+        if m:
+            idx = int(m.group(1))
+            ev = self.events.get(idx)
+            if ev is None:
+                ev = Event(index=idx, start_ms=0)
+                self.events[idx] = ev
+            ev.complete_ms = int(m.group(2))
+            ev.complete_dt_ms = int(m.group(3))
+            ev.complete_success = m.group(4) == "true"
+            return
+        m = RESUMED_RE.search(line)
+        if m:
+            idx = int(m.group(1))
+            ev = self.events.get(idx)
+            if ev is None:
+                ev = Event(index=idx, start_ms=0)
+                self.events[idx] = ev
+            ev.resumed_ms = int(m.group(2))
+            ev.resumed_dt_ms = int(m.group(3))
+
+    def get_event(self, index: int) -> Optional[Event]:
+        return self.events.get(index)
+
+    def recent_log(self) -> str:
+        return "\n".join(list(self.recent_lines.queue))
+
+
 def adb(args: List[str], check: bool = True) -> str:
     cmd = ["adb"] + args
     result = subprocess.run(cmd, capture_output=True, text=True, check=check)
@@ -77,60 +165,10 @@ def send_capture_intent(index: int) -> None:
     ])
 
 
-def clear_logcat() -> None:
-    adb(["logcat", "-c"])
-
-
-def dump_logcat() -> str:
-    # Use verbose level so we can see the periodic "Camera health check OK"
-    # (verbose) and the "No camera devices initially found" (debug) messages.
-    try:
-        return adb(["logcat", "-d", "-s", f"{TAG}:V"])
-    except subprocess.CalledProcessError as e:
-        # ADB can briefly drop out after a USB host reset; tolerate it.
-        print(f"  [adb] logcat failed ({e.returncode}), retrying...")
-        return ""
-
-
-def parse_logcat(log: str, events: dict) -> None:
-    for line in log.splitlines():
-        m = START_RE.search(line)
-        if m:
-            idx = int(m.group(1))
-            events[idx] = Event(
-                index=idx,
-                start_ms=int(m.group(2)),
-                complete_ms=None,
-                complete_dt_ms=None,
-                complete_success=None,
-                resumed_ms=None,
-                resumed_dt_ms=None,
-                wait_before_next_s=None,
-            )
-            continue
-        m = COMPLETE_RE.search(line)
-        if m:
-            idx = int(m.group(1))
-            if idx not in events:
-                events[idx] = Event(index=idx, start_ms=0)
-            events[idx].complete_ms = int(m.group(2))
-            events[idx].complete_dt_ms = int(m.group(3))
-            events[idx].complete_success = m.group(4) == "true"
-            continue
-        m = RESUMED_RE.search(line)
-        if m:
-            idx = int(m.group(1))
-            if idx not in events:
-                events[idx] = Event(index=idx, start_ms=0)
-            events[idx].resumed_ms = int(m.group(2))
-            events[idx].resumed_dt_ms = int(m.group(3))
-
-
-def wait_for_event(events: dict, index: int, field: str, timeout: float = 30.0) -> bool:
+def wait_for_event(reader: LogcatReader, index: int, field: str, timeout: float = 30.0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
-        parse_logcat(dump_logcat(), events)
-        ev = events.get(index)
+        ev = reader.get_event(index)
         if ev and getattr(ev, field) is not None:
             return True
         time.sleep(0.1)
@@ -175,43 +213,42 @@ def recover_usb_host() -> None:
     time.sleep(4.0)
 
 
-def wait_for_camera_healthy(timeout: float = 60.0) -> bool:
+def wait_for_camera_healthy(reader: LogcatReader, timeout: float = 60.0) -> bool:
     """Poll logcat until the camera is streaming, or timeout."""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        log = dump_logcat()
-        if is_camera_healthy(log):
+        if is_camera_healthy(reader.recent_log()):
             return True
         time.sleep(0.5)
     return False
 
 
-def ensure_camera_healthy(recovery_attempts: int = 3) -> bool:
+def ensure_camera_healthy(reader: LogcatReader, recovery_attempts: int = 3) -> bool:
     """Ensure the camera is streaming, running USB host recovery if needed."""
-    if is_camera_healthy(dump_logcat()):
+    if is_camera_healthy(reader.recent_log()):
         return True
 
     for attempt in range(1, recovery_attempts + 1):
         print(f"  [recover] Camera not healthy (attempt {attempt}/{recovery_attempts})")
         recover_usb_host()
-        if wait_for_camera_healthy(timeout=60.0):
+        if wait_for_camera_healthy(reader, timeout=60.0):
             print("  [recover] Camera healthy again")
             return True
 
     return False
 
 
-def recover_from_cdc_failure() -> bool:
+def recover_from_cdc_failure(reader: LogcatReader) -> bool:
     """If a CDC command failure is present, reset the Android USB host port.
 
     The preview can remain healthy while the CDC OUT endpoint becomes stale,
     so this checks the failure pattern explicitly and only then runs recovery.
     """
-    if not has_cdc_command_failure(dump_logcat()):
+    if not has_cdc_command_failure(reader.recent_log()):
         return False
     print("  [recover] Detected CDC command failure, resetting USB host port...")
     recover_usb_host()
-    if wait_for_camera_healthy(timeout=60.0):
+    if wait_for_camera_healthy(reader, timeout=60.0):
         print("  [recover] CDC path recovered (camera healthy)")
         return True
     return False
@@ -248,30 +285,33 @@ def main() -> int:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    reader = LogcatReader()
+    reader.start()
+
     print("Starting app...")
     adb(["shell", "am", "start", "-S", "-n", ACTIVITY])
     time.sleep(3.0)
 
     print(f"Running {args.count} simulated captures...")
-    events: dict[int, Event] = {}
-    clear_logcat()
 
     print("Ensuring camera is healthy before starting...")
-    if not ensure_camera_healthy():
+    if not ensure_camera_healthy(reader):
         print("ERROR: Camera did not become healthy; aborting.")
+        reader.stop()
         return 1
 
     for i in range(args.count):
         # Before each tap, make sure both preview and CDC are usable.  The CDC
         # command path can die while the MJPEG preview keeps running.
         if i > 0:
-            if not ensure_camera_healthy() and not recover_from_cdc_failure():
+            if not ensure_camera_healthy(reader) and not recover_from_cdc_failure(reader):
                 print(f"ERROR: Camera/CDC did not recover before tap {i}; aborting.")
+                reader.stop()
                 return 1
 
         wait_s = random.uniform(args.wait_min, args.wait_max)
         if i > 0:
-            prev = events.get(i - 1)
+            prev = reader.get_event(i - 1)
             if prev and prev.resumed_ms:
                 # Record the wait interval we used for event i (time from previous resume to this tap).
                 prev.wait_before_next_s = wait_s
@@ -282,15 +322,15 @@ def main() -> int:
         send_capture_intent(i)
 
         print(f"Tap {i}: waiting for complete...")
-        if not wait_for_event(events, i, "complete_ms", timeout=60.0):
+        if not wait_for_event(reader, i, "complete_ms", timeout=60.0):
             print(f"  WARNING: capture {i} did not complete in time")
             # Keep going; we'll report missing data at the end.
 
         print(f"Tap {i}: waiting for stream resume...")
-        if not wait_for_event(events, i, "resumed_ms", timeout=60.0):
+        if not wait_for_event(reader, i, "resumed_ms", timeout=60.0):
             print(f"  WARNING: capture {i} stream did not resume in time")
 
-        ev = events.get(i)
+        ev = reader.get_event(i)
         if ev:
             print(f"  complete={ev.complete_dt_ms}ms resume={ev.resumed_dt_ms}ms success={ev.complete_success}")
 
@@ -298,22 +338,22 @@ def main() -> int:
         # the MJPEG preview continues.  Detect that specific failure pattern and
         # reset the Android USB host port before the next tap.
         if i < args.count - 1 and ev and not ev.complete_success:
-            if not recover_from_cdc_failure():
+            if not recover_from_cdc_failure(reader):
                 print(f"ERROR: CDC path did not recover after failed capture {i}; aborting.")
+                reader.stop()
                 return 1
 
-    # Pull final logs in case anything was missed.
-    parse_logcat(dump_logcat(), events)
+    reader.stop()
 
-    complete_times = [e.complete_dt_ms for e in events.values() if e.complete_dt_ms is not None]
-    resume_times = [e.resumed_dt_ms for e in events.values() if e.resumed_dt_ms is not None]
-    wait_intervals = [e.wait_before_next_s for e in events.values() if e.wait_before_next_s is not None]
+    complete_times = [e.complete_dt_ms for e in reader.events.values() if e.complete_dt_ms is not None]
+    resume_times = [e.resumed_dt_ms for e in reader.events.values() if e.resumed_dt_ms is not None]
+    wait_intervals = [e.wait_before_next_s for e in reader.events.values() if e.wait_before_next_s is not None]
 
     print("\nResults:")
     print(f"  Total events: {args.count}")
     print(f"  Completed:    {len(complete_times)} / {args.count}")
     print(f"  Resumed:      {len(resume_times)} / {args.count}")
-    print(f"  Success:      {sum(1 for e in events.values() if e.complete_success)} / {args.count}")
+    print(f"  Success:      {sum(1 for e in reader.events.values() if e.complete_success)} / {args.count}")
 
     if complete_times:
         print(f"  tap→complete: mean={np.mean(complete_times):.1f}ms median={np.percentile(complete_times, 50):.1f}ms p95={np.percentile(complete_times, 95):.1f}ms")
@@ -332,7 +372,7 @@ def main() -> int:
     csv_path = out_dir / "events.csv"
     with open(csv_path, "w") as f:
         f.write("index,start_ms,complete_ms,complete_dt_ms,success,resumed_ms,resumed_dt_ms,wait_before_next_s\n")
-        for e in sorted(events.values(), key=lambda x: x.index):
+        for e in sorted(reader.events.values(), key=lambda x: x.index):
             f.write(
                 f"{e.index},{e.start_ms},"
                 f"{e.complete_ms if e.complete_ms is not None else ''},"
