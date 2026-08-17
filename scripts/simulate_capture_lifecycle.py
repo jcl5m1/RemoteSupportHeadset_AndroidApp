@@ -82,7 +82,9 @@ def clear_logcat() -> None:
 
 
 def dump_logcat() -> str:
-    return adb(["logcat", "-d", "-s", f"{TAG}:I"])
+    # Use verbose level so we can see the periodic "Camera health check OK"
+    # (verbose) and the "No camera devices initially found" (debug) messages.
+    return adb(["logcat", "-d", "-s", f"{TAG}:V"])
 
 
 def parse_logcat(log: str, events: dict) -> None:
@@ -136,7 +138,7 @@ STALL_RE = re.compile(
     r"Camera health check: no camera open|"
     r"Could not open CDC port"
 )
-HEALTHY_RE = re.compile(r"Camera health check OK|FPS: \d")
+HEALTHY_RE = re.compile(r"Camera health check OK|FPS: \d|AprilTag cycle:")
 
 
 def is_camera_stalled(log: str) -> bool:
