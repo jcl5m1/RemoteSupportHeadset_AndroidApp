@@ -263,6 +263,13 @@ def main() -> int:
         return 1
 
     for i in range(args.count):
+        # Before each tap, make sure both preview and CDC are usable.  The CDC
+        # command path can die while the MJPEG preview keeps running.
+        if i > 0:
+            if not ensure_camera_healthy() and not recover_from_cdc_failure():
+                print(f"ERROR: Camera/CDC did not recover before tap {i}; aborting.")
+                return 1
+
         wait_s = random.uniform(args.wait_min, args.wait_max)
         if i > 0:
             prev = events.get(i - 1)
@@ -284,18 +291,17 @@ def main() -> int:
         if not wait_for_event(events, i, "resumed_ms", timeout=60.0):
             print(f"  WARNING: capture {i} stream did not resume in time")
 
-        # If the camera disappeared after this capture, try a software-only
-        # USB host reset before proceeding.
-        if i < args.count - 1 and not ensure_camera_healthy():
-            # Preview may still be running while the CDC command path is dead.
-            # Look for that specific failure pattern and reset just the host port.
-            if not recover_from_cdc_failure():
-                print(f"ERROR: Camera did not recover after capture {i}; aborting.")
-                return 1
-
         ev = events.get(i)
         if ev:
             print(f"  complete={ev.complete_dt_ms}ms resume={ev.resumed_dt_ms}ms success={ev.complete_success}")
+
+        # A failed capture often leaves the CDC OUT endpoint stale even though
+        # the MJPEG preview continues.  Detect that specific failure pattern and
+        # reset the Android USB host port before the next tap.
+        if i < args.count - 1 and ev and not ev.complete_success:
+            if not recover_from_cdc_failure():
+                print(f"ERROR: CDC path did not recover after failed capture {i}; aborting.")
+                return 1
 
     # Pull final logs in case anything was missed.
     parse_logcat(dump_logcat(), events)
