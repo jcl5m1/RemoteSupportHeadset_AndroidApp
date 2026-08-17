@@ -173,15 +173,17 @@ The app can reflash the ESP32-P4 over the high-speed USB-OTG CDC download port. 
    ```bash
    python3 serve_firmware.py --port 8765
    ```
-   This writes `build/firmware.zip` containing `bootloader.bin`, `partition-table.bin`, and `usb_webcam.bin`, and prints a reachable URL such as `http://192.168.1.123:8765/firmware.zip`.
+   This writes `build/firmware_YYYYMMDD_HHMMSS.zip` containing `bootloader.bin`, `partition-table.bin`, and `usb_webcam.bin`, updates `build/firmware_latest.txt` with the latest zip name, and prints a reachable URL such as `http://192.168.1.123:8765/firmware_20260817_123045.zip`.
 2. Open **Settings → Update firmware** in the app and paste the `.zip` URL, or launch the activity with the URL and `--ez flash_now true` to skip the confirmation dialog:
    ```bash
    adb shell am start -S -n com.example.remotesupportheadset/.DualCameraActivity \
        --ez flash_now true \
-       --es firmware_url http://<host-ip>:8765/firmware.zip
+       --es firmware_url http://<host-ip>:8765/firmware_YYYYMMDD_HHMMSS.zip
    ```
 3. The app downloads the zip to a temporary cache file, extracts the three binaries into `/sdcard/Android/data/com.example.remotesupportheadset/files/Firmware/`, reboots the ESP32 into ROM download mode, and flashes each image to its offset via `libesp32flasher.so`.
 4. After a successful flash the ESP32 resets and re-enumerates as a UVC+CDC device.
+
+The current firmware build version is queried over the high-speed CDC port and shown in the bottom UI as **FW: yyyymmdd_hhmmss**. **Settings → Check for latest firmware** reads `firmware_latest.txt` from the directory URL, compares versions, and offers to download and flash a newer zip.
 
 If the binaries are already on the phone, `--ez flash_now true` alone starts flashing from the existing files.
 

@@ -98,6 +98,7 @@ class DualCameraActivity : AppCompatActivity() {
         private const val DEVICE_POLL_INTERVAL_MS = 1500L
         private const val CAMERA_HEALTH_CHECK_INTERVAL_MS = 1000L
         private const val CAMERA_FRAME_TIMEOUT_MS = 4000L
+        private const val FIRMWARE_VERSION_INTERVAL_MS = 5000L
 
         private const val ACTION_USB_FLASH_PERMISSION = "com.example.remotesupportheadset.USB_FLASH_PERMISSION"
         private const val ESPRESSIF_VID = 0x303A
@@ -127,6 +128,7 @@ class DualCameraActivity : AppCompatActivity() {
     private lateinit var micLevelLabel: TextView
     private lateinit var spkLevelMeter: ProgressBar
     private lateinit var spkLevelLabel: TextView
+    private lateinit var firmwareVersionLabel: TextView
 
     private var cameraClient: MultiCameraClient? = null
     private var currentCamera: MultiCameraClient.Camera? = null
@@ -227,6 +229,16 @@ class DualCameraActivity : AppCompatActivity() {
     private val pendingFlashFiles = mutableListOf<Pair<String, Int>>()
     private var flashTotalBytes = 0L
     private var flashProgressBytesWritten = 0L
+
+    // Cached firmware build version reported by the ESP32 over CDC.
+    @Volatile
+    private var firmwareBuildVersion: String? = null
+    private val firmwareVersionRunnable = object : Runnable {
+        override fun run() {
+            queryFirmwareBuildVersion()
+            mainHandler.postDelayed(this, FIRMWARE_VERSION_INTERVAL_MS)
+        }
+    }
 
     // Cached location for geotagging photos/videos. Updated whenever getCurrentLocation()
     // successfully reads a fresh last-known location. Volatile so background capture
@@ -378,6 +390,7 @@ class DualCameraActivity : AppCompatActivity() {
         micLevelLabel = findViewById(R.id.mic_level_label)
         spkLevelMeter = findViewById(R.id.spk_level_meter)
         spkLevelLabel = findViewById(R.id.spk_level_label)
+        firmwareVersionLabel = findViewById(R.id.firmware_version_label)
         aprilTagOverlay = findViewById(R.id.apriltag_overlay)
 
         applyPreviewRotation()
@@ -1022,14 +1035,163 @@ class DualCameraActivity : AppCompatActivity() {
     // ESP32-P4 firmware flashing over USB-OTG
     // -------------------------------------------------------------------------
 
+    private fun queryFirmwareBuildVersion() {
+        Thread {
+            val helper = CdcCommandHelper(this)
+            val version = try {
+                if (helper.open()) {
+                    val response = helper.queryBuildVersion()
+                    helper.close()
+                    Log.d(TAG, "Firmware version raw response: '$response'")
+                    parseBuildVersion(response)
+                } else {
+                    Log.d(TAG, "Could not open CDC port for firmware version query")
+                    null
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to query firmware build version", e)
+                null
+            }
+            version?.let { firmwareBuildVersion = it }
+            if (!isFinishing) {
+                runOnUiThread {
+                    firmwareVersionLabel.text = "FW: ${version ?: "--"}"
+                }
+            }
+        }.apply { name = "FirmwareVersionQueryThread"; start() }
+    }
+
+    private fun parseBuildVersion(response: String?): String? {
+        if (response.isNullOrBlank()) return null
+        // Expect "BUILD_VERSION 20260817_123045" or legacy "BUILD 20260817-123045".
+        val regex = Regex("""BUILD(?:_VERSION)?\s+(\d{8}[_-]\d{6})""")
+        val match = regex.find(response.trim())
+        val raw = match?.groupValues?.get(1)
+        // Normalize to yyyymmdd_hhmmss.
+        return raw?.replace("-", "_")
+    }
+
+    private fun checkForLatestFirmware(prefillUrl: String? = null) {
+        val current = firmwareBuildVersion
+        if (current.isNullOrBlank()) {
+            Toast.makeText(this, "Current firmware version not yet known", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        if (prefillUrl != null) {
+            fetchLatestFirmwareVersion(prefillUrl, current)
+            return
+        }
+
+        val input = EditText(this).apply {
+            hint = "https://example.com/firmware/"
+            setSingleLine(true)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Check for latest firmware")
+            .setMessage("Enter the directory URL, or a .zip URL whose parent directory contains firmware_latest.txt")
+            .setView(input)
+            .setPositiveButton("Check") { _, _ ->
+                val baseUrl = input.text.toString().trim()
+                if (baseUrl.isNotEmpty()) {
+                    fetchLatestFirmwareVersion(baseUrl, current)
+                } else {
+                    Toast.makeText(this, "URL is required", Toast.LENGTH_SHORT).show()
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun fetchLatestFirmwareVersion(baseUrl: String, currentVersion: String) {
+        Thread {
+            // Accept either a directory URL or a direct zip URL.
+            val directoryUrl = if (baseUrl.endsWith(".zip", ignoreCase = true)) {
+                baseUrl.substringBeforeLast('/')
+            } else {
+                baseUrl.trimEnd('/')
+            }
+            val latestUrl = "$directoryUrl/firmware_latest.txt"
+            val latestText = downloadTextFile(latestUrl)
+            val latestZip = latestText?.trim()
+            val latestVersion = latestZip?.let { extractVersionFromZipName(it) }
+
+            if (latestVersion == null) {
+                runOnUiThread {
+                    Toast.makeText(this, "Could not read latest firmware version", Toast.LENGTH_LONG).show()
+                }
+                return@Thread
+            }
+
+            Log.i(TAG, "Current firmware version: $currentVersion, latest: $latestVersion")
+
+            runOnUiThread {
+                when {
+                    latestVersion == currentVersion -> {
+                        Toast.makeText(this, "Firmware is up to date ($currentVersion)", Toast.LENGTH_LONG).show()
+                    }
+                    isNewerFirmwareVersion(currentVersion, latestVersion) -> {
+                        AlertDialog.Builder(this)
+                            .setTitle("Firmware update available")
+                            .setMessage("Current: $currentVersion\nLatest: $latestVersion\n\nDownload and flash now?")
+                            .setPositiveButton("Update") { _, _ ->
+                                val zipUrl = "$directoryUrl/$latestZip"
+                                downloadFirmwareFromUrl(zipUrl, skipConfirmation = false)
+                            }
+                            .setNegativeButton("Cancel", null)
+                            .show()
+                    }
+                    else -> {
+                        Toast.makeText(this, "Current firmware ($currentVersion) is newer than server ($latestVersion)", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+        }.apply { name = "FirmwareLatestCheckThread"; start() }
+    }
+
+    private fun extractVersionFromZipName(zipName: String): String? {
+        val regex = Regex("""firmware_(\d{8}_\d{6})\.zip""")
+        return regex.find(zipName)?.groupValues?.get(1)
+    }
+
+    private fun isNewerFirmwareVersion(current: String, latest: String): Boolean {
+        // Versions are yyyymmdd_hhmmss, so simple string comparison works.
+        return latest > current
+    }
+
+    private fun downloadTextFile(urlString: String): String? {
+        var connection: HttpURLConnection? = null
+        var input: InputStream? = null
+        return try {
+            val url = URL(urlString)
+            connection = url.openConnection() as HttpURLConnection
+            connection.requestMethod = "GET"
+            connection.connectTimeout = 15000
+            connection.readTimeout = 15000
+            val responseCode = connection.responseCode
+            if (responseCode != HttpURLConnection.HTTP_OK) {
+                Log.w(TAG, "Text download failed for $urlString: HTTP $responseCode")
+                return null
+            }
+            input = connection.inputStream
+            input.bufferedReader().use { it.readText() }
+        } catch (e: Exception) {
+            Log.e(TAG, "Text download error for $urlString", e)
+            null
+        } finally {
+            input?.close()
+            connection?.disconnect()
+        }
+    }
+
     private fun promptForFirmwareUrl() {
         val input = EditText(this).apply {
-            hint = "https://example.com/firmware.zip"
+            hint = "https://example.com/firmware_20260817_123045.zip"
             setSingleLine(true)
         }
         AlertDialog.Builder(this)
             .setTitle("Update firmware")
-            .setMessage("Enter the URL of a firmware .zip file containing bootloader.bin, partition-table.bin, and usb_webcam.bin")
+            .setMessage("Enter the URL of a firmware .zip file (e.g. firmware_YYYYMMDD_HHMMSS.zip) containing bootloader.bin, partition-table.bin, and usb_webcam.bin")
             .setView(input)
             .setPositiveButton("Download") { _, _ ->
                 val url = input.text.toString().trim()
@@ -1769,6 +1931,11 @@ class DualCameraActivity : AppCompatActivity() {
                     R.id.action_update_firmware -> {
                         Log.d(TAG, "Settings: update firmware selected")
                         promptForFirmwareUrl()
+                        true
+                    }
+                    R.id.action_check_latest_firmware -> {
+                        Log.d(TAG, "Settings: check latest firmware selected")
+                        checkForLatestFirmware()
                         true
                     }
                     R.id.action_diagnostics -> {
@@ -2816,6 +2983,7 @@ class DualCameraActivity : AppCompatActivity() {
         mainHandler.post(cameraHealthCheckRunnable)
         startMicMeter()
         startSpkMeter()
+        mainHandler.post(firmwareVersionRunnable)
     }
 
     override fun onStop() {
@@ -2830,6 +2998,7 @@ class DualCameraActivity : AppCompatActivity() {
         mainHandler.removeCallbacks(diagnosticsRunnable)
         mainHandler.removeCallbacks(devicePollRunnable)
         mainHandler.removeCallbacks(cameraHealthCheckRunnable)
+        mainHandler.removeCallbacks(firmwareVersionRunnable)
         currentCamera?.closeCamera()
         currentCamera = null
         currentDevice = null

@@ -82,7 +82,7 @@ The colour-correction matrix is applied automatically to the live preview once i
 
 ### ESP32-P4 firmware update
 
-The app downloads a single firmware `.zip` file, extracts the three binaries, and flashes them over USB-OTG.
+The app downloads a single firmware `.zip` file, extracts the three binaries, and flashes them over USB-OTG. The current firmware build version is shown in the bottom control strip as **FW: yyyymmdd_hhmmss**.
 
 #### Update from URL
 
@@ -92,6 +92,8 @@ Open **Settings → Update firmware** and enter the URL of a `.zip` file that co
 - `partition-table.bin`
 - `usb_webcam.bin`
 
+Zip files use the naming convention `firmware_YYYYMMDD_HHMMSS.zip`, where the timestamp is the firmware build version.
+
 The app downloads the zip to a temporary cache file, extracts the three binaries into `/sdcard/Android/data/com.example.remotesupportheadset/files/Firmware/`, and then starts the flash flow automatically.
 
 For local development, build the firmware and run the helper in the sibling `esp32-wearable/esp32-p4-wearable/` directory:
@@ -100,13 +102,17 @@ For local development, build the firmware and run the helper in the sibling `esp
 python3 serve_firmware.py --port 8765
 ```
 
-This creates `build/firmware.zip` and prints a reachable URL such as `http://192.168.1.123:8765/firmware.zip`. Paste that URL into the app, or send it directly to the phone over ADB Wi-Fi:
+This creates `build/firmware_YYYYMMDD_HHMMSS.zip` and `build/firmware_latest.txt`, and prints a reachable URL such as `http://192.168.1.123:8765/firmware_20260817_123045.zip`. Paste that URL into the app, or send it directly to the phone over ADB Wi-Fi:
 
 ```bash
 adb shell am start -S -n com.example.remotesupportheadset/.DualCameraActivity \
     --ez flash_now true \
-    --es firmware_url http://<host-ip>:8765/firmware.zip
+    --es firmware_url http://<host-ip>:8765/firmware_YYYYMMDD_HHMMSS.zip
 ```
+
+#### Check for latest firmware
+
+Open **Settings → Check for latest firmware** and enter the directory URL (or a `.zip` URL). The app reads `firmware_latest.txt` from the parent directory, compares the server's latest build version with the version currently running on the ESP32, and prompts to download and flash if a newer version is available.
 
 #### Update from local files
 

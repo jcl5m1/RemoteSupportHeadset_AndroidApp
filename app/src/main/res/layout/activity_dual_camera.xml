@@ -160,6 +160,18 @@
                 android:paddingHorizontal="8dp"
                 android:backgroundTint="#AA3333"
                 android:textColor="#FFFFFF" />
+
+            <TextView
+                android:id="@+id/firmware_version_label"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:minWidth="80dp"
+                android:text="FW: --"
+                android:textColor="#AAAAAA"
+                android:textSize="10sp"
+                android:gravity="center"
+                android:visibility="visible" />
         </LinearLayout>
 
         <View

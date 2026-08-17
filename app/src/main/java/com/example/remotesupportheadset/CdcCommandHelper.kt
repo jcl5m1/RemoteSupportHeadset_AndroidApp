@@ -106,6 +106,27 @@ class CdcCommandHelper(context: Context) {
     }
 
     /**
+     * Ask the firmware to report its build version. Returns the raw response
+     * line, e.g. "BUILD_VERSION 20260817_123045", or null on failure.
+     */
+    fun queryBuildVersion(): String? {
+        val p = port ?: return null
+        return try {
+            drainInput(p)
+            val out = "version\r\n".toByteArray(Charset.forName("UTF-8"))
+            p.write(out, 500)
+            Thread.sleep(120)
+            readResponse(p)
+        } catch (e: IOException) {
+            Log.w(TAG, "CDC version query failed", e)
+            null
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            null
+        }
+    }
+
+    /**
      * Ask the firmware to report the current exposure register value and its
      * duration in microseconds.
      *
