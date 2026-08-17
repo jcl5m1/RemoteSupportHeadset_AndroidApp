@@ -844,7 +844,7 @@ class DualCameraActivity : AppCompatActivity() {
             return
         }
 
-        Thread { captureStillImageWithRetries(1) }.apply { name = "StillCaptureThread"; start() }
+        Thread { captureStillImageWithRetries(3) }.apply { name = "StillCaptureThread"; start() }
     }
 
     /**
@@ -896,7 +896,7 @@ class DualCameraActivity : AppCompatActivity() {
                     runOnUiThread {
                         Toast.makeText(this, "Capture $i/$count", Toast.LENGTH_SHORT).show()
                     }
-                    val ok = captureStillImageWithRetries(3)
+                    val ok = captureStillImageWithRetries(3) { !lifecycleTestRunning }
                     if (ok) lifecycleSuccess++ else lifecycleFail++
                     Log.i(TAG, "Lifecycle test progress $i/$count ok=$ok (success=$lifecycleSuccess fail=$lifecycleFail)")
                     if (i < count && lifecycleTestRunning) {
@@ -2059,7 +2059,7 @@ class DualCameraActivity : AppCompatActivity() {
      * Capture one still image, retrying up to [maxRetries] times if the CDC
      * path returns an error. Returns true if a JPEG was saved.
      */
-    private fun captureStillImageWithRetries(maxRetries: Int): Boolean {
+    private fun captureStillImageWithRetries(maxRetries: Int, cancelCheck: () -> Boolean = { false }): Boolean {
         captureLock.lock()
         try {
             if (isCapturing) {
@@ -2078,8 +2078,8 @@ class DualCameraActivity : AppCompatActivity() {
         var succeeded = false
         try {
             for (attempt in 1..maxRetries) {
-                if (!lifecycleTestRunning && maxRetries > 1) {
-                    // If this was a lifecycle retry and the user cancelled, bail.
+                if (cancelCheck()) {
+                    Log.d(TAG, "Capture cancelled mid-retry")
                     break
                 }
                 try {
