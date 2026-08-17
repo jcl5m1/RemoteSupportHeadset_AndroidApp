@@ -167,10 +167,21 @@ You can also open the project in Android Studio and let it sync Gradle automatic
 
 ## ESP32-P4 firmware flashing
 
-The app can reflash the ESP32-P4 over the high-speed USB-OTG CDC download port. The normal path downloads a single firmware `.zip` from a URL, extracts the three binaries, and flashes them:
+The app can reflash the ESP32-P4 over the high-speed USB-OTG CDC download port. The preferred deploy path is the one-command helper in the sibling `esp32-wearable/esp32-p4-wearable/` project:
 
-1. Build the firmware in the sibling `esp32-wearable/esp32-p4-wearable/` project and package it:
+```bash
+python3 deploy_to_phone.py
+```
+
+This builds the firmware, serves the timestamped zip locally, sends the ADB intent to the Android app, and tails `adb logcat` until the flash finishes or fails. Options include `--device`, `--port`, `--no-build`, and `--no-logcat`.
+
+### Manual path
+
+If you need to run the steps separately:
+
+1. Build the firmware and package it:
    ```bash
+   idf.py build
    python3 serve_firmware.py --port 8765
    ```
    This writes `build/firmware_YYYYMMDD_HHMMSS.zip` containing `bootloader.bin`, `partition-table.bin`, and `usb_webcam.bin`, updates `build/firmware_latest.txt` with the latest zip name, and prints a reachable URL such as `http://192.168.1.123:8765/firmware_20260817_123045.zip`.
