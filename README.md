@@ -110,6 +110,8 @@ adb shell am start -S -n com.example.remotesupportheadset/.DualCameraActivity \
     --es firmware_url http://<host-ip>:8765/firmware_YYYYMMDD_HHMMSS.zip
 ```
 
+For a one-command loop, the firmware repo also provides `deploy_to_phone.py`, which builds, serves, sends the intent, and tails logcat until the flash finishes.
+
 #### Check for latest firmware
 
 Open **Settings → Check for latest firmware** and enter the directory URL (or a `.zip` URL). The app reads `firmware_latest.txt` from the parent directory, compares the server's latest build version with the version currently running on the ESP32, and prompts to download and flash if a newer version is available.
