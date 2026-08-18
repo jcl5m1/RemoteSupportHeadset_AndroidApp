@@ -567,6 +567,7 @@ class DualCameraActivity : AppCompatActivity() {
         // It defaults to off and can be toggled from Settings.
         aprilTagDetectionEnabled = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
             .getBoolean(PREF_APRILTAG_ENABLED, false)
+        Log.d(TAG, "AprilTag pref loaded: enabled=$aprilTagDetectionEnabled")
         if (aprilTagDetectionEnabled) {
             startLiveAprilTagDetection()
         } else {
@@ -2193,7 +2194,7 @@ class DualCameraActivity : AppCompatActivity() {
             setOnMenuItemClickListener { item ->
                 when (item.itemId) {
                     R.id.action_enable_apriltag -> {
-                        setAprilTagDetectionEnabled(!aprilTagDetectionEnabled, source = "settings")
+                        setAprilTagDetectionEnabled(!aprilTagDetectionEnabled, source = "settings", persist = true)
                         true
                     }
                     R.id.action_update_firmware -> {
@@ -3107,24 +3108,31 @@ class DualCameraActivity : AppCompatActivity() {
      * preview bitmap and updates [aprilTagOverlay].
      */
     /**
-     * Enable or disable live AprilTag detection and persist the choice.
+     * Enable or disable live AprilTag detection. When [persist] is true the
+     * choice is saved to SharedPreferences (used by the Settings UI). When
+     * false it is a transient override for the current session (used by
+     * intent extras so automation cannot accidentally change the persisted
+     * default).
+     *
      * When disabled the detection thread is stopped and the overlay cleared,
      * which also stops the grayscale Y-plane downsampling compute.
      */
-    private fun setAprilTagDetectionEnabled(enabled: Boolean, source: String = "intent") {
+    private fun setAprilTagDetectionEnabled(enabled: Boolean, source: String = "intent", persist: Boolean = true) {
         if (aprilTagDetectionEnabled == enabled) return
         aprilTagDetectionEnabled = enabled
-        getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-            .edit()
-            .putBoolean(PREF_APRILTAG_ENABLED, enabled)
-            .apply()
+        if (persist) {
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .edit()
+                .putBoolean(PREF_APRILTAG_ENABLED, enabled)
+                .apply()
+        }
         if (enabled) {
             startLiveAprilTagDetection()
         } else {
             stopLiveAprilTagDetection()
             aprilTagOverlay.detections = emptyList()
         }
-        Log.d(TAG, "AprilTag detection ${if (enabled) "enabled" else "disabled"} (source=$source)")
+        Log.d(TAG, "AprilTag detection ${if (enabled) "enabled" else "disabled"} (source=$source, persist=$persist)")
     }
 
     private fun startLiveAprilTagDetection() {
@@ -3824,8 +3832,8 @@ class DualCameraActivity : AppCompatActivity() {
 
         if (intent.hasExtra(EXTRA_APRILTAG_ENABLED)) {
             val enabled = intent.getBooleanExtra(EXTRA_APRILTAG_ENABLED, false)
-            Log.d(TAG, "EXTRA_APRILTAG_ENABLED=$enabled requested")
-            setAprilTagDetectionEnabled(enabled, source = "intent")
+            Log.d(TAG, "EXTRA_APRILTAG_ENABLED=$enabled requested (transient override)")
+            setAprilTagDetectionEnabled(enabled, source = "intent", persist = false)
         }
 
         if (intent.getBooleanExtra(EXTRA_RECORD_START, false)) {
