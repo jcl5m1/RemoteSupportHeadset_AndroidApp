@@ -39,6 +39,15 @@ class CdcCommandHelper(
         private const val PID_CDC_UVC = 0x4022
         private const val BAUD = 115200
         private const val BULK_TIMEOUT_MS = 500
+
+        /** Global lock for the shared CDC command channel.
+         *
+         *  The UVC camera stack owns the underlying [UsbDeviceConnection], but
+         *  all text-command traffic from this app must be serialized.  The
+         *  firmware processes commands in order and we need each command's
+         *  response to be read by the thread that sent it.
+         */
+        private val COMMAND_LOCK = Any()
     }
 
     private val usbManager: UsbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
@@ -57,7 +66,7 @@ class CdcCommandHelper(
      * Try to open the CDC port. Returns true on success. Must be called after
      * the user has granted USB permission.
      */
-    fun open(): Boolean {
+    fun open(): Boolean = synchronized(COMMAND_LOCK) {
         close()
 
         // Prefer the raw connection/endpoints supplied by the caller.
@@ -72,10 +81,10 @@ class CdcCommandHelper(
             clearEndpointHalt(rawOut)
             clearEndpointHalt(rawIn)
             drainRawInput()
-            return true
+            return@synchronized true
         }
 
-        return openViaUsbSerial()
+        return@synchronized openViaUsbSerial()
     }
 
     private fun openViaUsbSerial(): Boolean {
@@ -228,16 +237,16 @@ class CdcCommandHelper(
         return sendCommand("flicker")
     }
 
-    fun sendCommand(cmd: String): String? {
+    fun sendCommand(cmd: String): String? = synchronized(COMMAND_LOCK) {
         val rawConn = rawConnection
         val rawOut = rawOutEndpoint
         val rawIn = rawInEndpoint
         if (rawConn != null && rawOut != null && rawIn != null) {
-            return sendRaw(rawConn, rawOut, rawIn, cmd)
+            return@synchronized sendRaw(rawConn, rawOut, rawIn, cmd)
         }
 
-        val p = port ?: return null
-        return try {
+        val p = port ?: return@synchronized null
+        return@synchronized try {
             drainInput(p)
             val out = "$cmd\r\n".toByteArray(Charset.forName("UTF-8"))
             p.write(out, 500)
@@ -266,8 +275,14 @@ class CdcCommandHelper(
                 Log.w(TAG, "Raw CDC OUT bulkTransfer failed for '$cmd': $written")
                 return null
             }
-            Thread.sleep(80)
-            readRawResponse(conn, inEp)
+            // Give the firmware time to schedule its CDC task, then poll until
+            // we see a response or a generous timeout expires.
+            Thread.sleep(120)
+            val response = readRawResponse(conn, inEp)
+            if (response.isNullOrBlank()) {
+                Log.d(TAG, "No CDC response for '$cmd'")
+            }
+            response
         } catch (e: Exception) {
             Log.w(TAG, "Raw CDC command failed for '$cmd'", e)
             null
@@ -276,13 +291,26 @@ class CdcCommandHelper(
 
     private fun readRawResponse(conn: UsbDeviceConnection, inEp: UsbEndpoint): String? {
         val buf = ByteArray(256)
+        val sb = StringBuilder()
+        val maxAttempts = 10
+        val readTimeoutMs = 120
         return try {
-            val n = conn.bulkTransfer(inEp, buf, buf.size, BULK_TIMEOUT_MS)
-            if (n > 0) {
-                String(buf, 0, n, Charset.forName("UTF-8")).trim()
-            } else {
-                ""
+            repeat(maxAttempts) { attempt ->
+                val n = conn.bulkTransfer(inEp, buf, buf.size, readTimeoutMs)
+                if (n > 0) {
+                    val chunk = String(buf, 0, n, Charset.forName("UTF-8"))
+                    sb.append(chunk)
+                    // Stop once we have a complete line; firmware responses end with \r\n.
+                    if (chunk.contains('\n') || chunk.contains('\r')) {
+                        return@readRawResponse sb.toString().trim()
+                    }
+                } else if (n < 0 && attempt == 0) {
+                    // Log a single bulk-transfer failure rather than every poll.
+                    Log.v(TAG, "Raw CDC read returned $n")
+                }
             }
+            // No full line seen yet; return whatever we accumulated (may be empty).
+            sb.toString().trim()
         } catch (e: Exception) {
             Log.w(TAG, "Raw CDC read failed", e)
             null

@@ -791,8 +791,12 @@ class DualCameraActivity : AppCompatActivity() {
                 return
             }
 
-            // Claim the data interface through the shared control block
-            ctrlBlock.claimInterface(dataIface, true)
+            // Claim both interfaces through the shared control block.  Some
+            // Android hosts require the control interface to be claimed before
+            // the SET_LINE_CODING / SET_CONTROL_LINE_STATE requests succeed.
+            val claimedControl = ctrlBlock.claimInterface(controlIface, true)
+            val claimedData = ctrlBlock.claimInterface(dataIface, true)
+            Log.d(TAG, "CDC interfaces claimed: control=$claimedControl, data=$claimedData")
 
             // Locate bulk endpoints on the data interface
             for (i in 0 until dataIface.endpointCount) {
@@ -810,11 +814,19 @@ class DualCameraActivity : AppCompatActivity() {
                 return
             }
 
-            // Standard CDC ACM init: 115200 8N1, DTR/RTS asserted
-            setCdcLineCoding(controlIface, 115200, 0, 0, 8)
-            setCdcControlLineState(controlIface, dtr = true, rts = true)
+            // Standard CDC ACM init: 115200 8N1, DTR/RTS asserted.
+            // Log the control-transfer results; failures here explain why the
+            // firmware's tud_cdc_connected() stays false and ignores commands.
+            val lineCodingResult = setCdcLineCoding(controlIface, 115200, 0, 0, 8)
+            val lineStateResult = setCdcControlLineState(controlIface, dtr = true, rts = true)
+            Log.d(TAG, "CDC ACM init: lineCoding=$lineCodingResult, controlLineState=$lineStateResult")
 
             Log.d(TAG, "CDC interface ready on ${device.deviceName}")
+
+            // Query the firmware version right away instead of waiting for the
+            // periodic runnable; this populates the on-screen label as soon as
+            // the device connects.
+            queryFirmwareStatus()
         } catch (e: Exception) {
             Log.e(TAG, "Failed to set up CDC", e)
         }
@@ -838,8 +850,8 @@ class DualCameraActivity : AppCompatActivity() {
         cdcInEndpoint?.let { clearEndpointHalt(it) }
     }
 
-    private fun setCdcLineCoding(controlInterface: UsbInterface, baud: Int, stopBits: Int, parity: Int, dataBits: Int) {
-        val conn = cdcConnection ?: return
+    private fun setCdcLineCoding(controlInterface: UsbInterface, baud: Int, stopBits: Int, parity: Int, dataBits: Int): Int {
+        val conn = cdcConnection ?: return -1
         val payload = byteArrayOf(
             (baud and 0xFF).toByte(),
             ((baud shr 8) and 0xFF).toByte(),
@@ -850,16 +862,16 @@ class DualCameraActivity : AppCompatActivity() {
             dataBits.toByte()
         )
         // 0x21 = host-to-device | class | interface recipient
-        conn.controlTransfer(0x21, 0x20, 0, controlInterface.id, payload, payload.size, CDC_TIMEOUT_MS)
+        return conn.controlTransfer(0x21, 0x20, 0, controlInterface.id, payload, payload.size, CDC_TIMEOUT_MS)
     }
 
-    private fun setCdcControlLineState(controlInterface: UsbInterface, dtr: Boolean, rts: Boolean) {
-        val conn = cdcConnection ?: return
+    private fun setCdcControlLineState(controlInterface: UsbInterface, dtr: Boolean, rts: Boolean): Int {
+        val conn = cdcConnection ?: return -1
         var value = 0
         if (dtr) value = value or 0x01
         if (rts) value = value or 0x02
         // 0x21 = host-to-device | class | interface recipient
-        conn.controlTransfer(0x21, 0x22, value, controlInterface.id, null, 0, CDC_TIMEOUT_MS)
+        return conn.controlTransfer(0x21, 0x22, value, controlInterface.id, null, 0, CDC_TIMEOUT_MS)
     }
 
     /**
@@ -881,9 +893,19 @@ class DualCameraActivity : AppCompatActivity() {
     private fun releaseCdc() {
         try {
             val ctrlBlock = currentCtrlBlock
+            val controlIface = cdcControlInterface
             val dataIface = cdcDataInterface
-            if (ctrlBlock != null && dataIface != null) {
-                ctrlBlock.releaseInterface(dataIface)
+            if (ctrlBlock != null) {
+                if (controlIface != null) {
+                    try {
+                        ctrlBlock.releaseInterface(controlIface)
+                    } catch (_: Exception) { }
+                }
+                if (dataIface != null) {
+                    try {
+                        ctrlBlock.releaseInterface(dataIface)
+                    } catch (_: Exception) { }
+                }
             }
         } catch (_: Exception) { }
         cdcConnection = null
@@ -1306,18 +1328,28 @@ class DualCameraActivity : AppCompatActivity() {
 
     private fun queryFirmwareStatus() {
         Thread {
-            val helper = CdcCommandHelper(this, currentDevice, currentCtrlBlock?.connection, cdcOutEndpoint, cdcInEndpoint)
             var version: String? = null
             var flickerHz: Int? = null
+            val helper = CdcCommandHelper(this, currentDevice, currentCtrlBlock?.connection, cdcOutEndpoint, cdcInEndpoint)
             try {
                 if (helper.open()) {
-                    val versionResponse = helper.queryBuildVersion()
-                    Log.d(TAG, "Firmware version raw response: '$versionResponse'")
-                    version = parseBuildVersion(versionResponse)
+                    version = queryBuildVersionWithRetry(helper)
+                    if (version == null && cdcOutEndpoint != null && cdcInEndpoint != null) {
+                        Log.d(TAG, "Firmware version empty; refreshing CDC state and retrying once")
+                        refreshCdcState()
+                        // Re-create helper because refreshCdcState may update endpoints/connection.
+                        val retryHelper = CdcCommandHelper(this, currentDevice, currentCtrlBlock?.connection, cdcOutEndpoint, cdcInEndpoint)
+                        if (retryHelper.open()) {
+                            version = queryBuildVersionWithRetry(retryHelper)
+                            retryHelper.close()
+                        }
+                    }
 
-                    val statusResponse = helper.queryExposureUs()
-                    Log.d(TAG, "Firmware status raw response: '$statusResponse'")
-                    flickerHz = parseFlickerHz(statusResponse)
+                    if (version != null) {
+                        val statusResponse = helper.queryExposureUs()
+                        Log.d(TAG, "Firmware status raw response: '$statusResponse'")
+                        flickerHz = parseFlickerHz(statusResponse)
+                    }
                     helper.close()
                 } else {
                     Log.d(TAG, "Could not open CDC port for firmware status query")
@@ -1329,10 +1361,25 @@ class DualCameraActivity : AppCompatActivity() {
             flickerHz?.let { cachedFlickerHz = it }
             if (!isFinishing) {
                 runOnUiThread {
-                    firmwareVersionLabel.text = "FW: ${version ?: "--"}"
+                    // Keep showing the last known version on transient failures so the
+                    // UI never flips back to "--" once we have learned it.
+                    val display = version ?: firmwareBuildVersion ?: "--"
+                    firmwareVersionLabel.text = "FW: $display"
+                    Log.d(TAG, "Updated firmware version label: FW: $display (queried=$version, cached=$firmwareBuildVersion)")
                 }
             }
         }.apply { name = "FirmwareStatusQueryThread"; start() }
+    }
+
+    private fun queryBuildVersionWithRetry(helper: CdcCommandHelper): String? {
+        repeat(2) { attempt ->
+            val response = helper.queryBuildVersion()
+            Log.d(TAG, "Firmware version raw response (attempt ${attempt + 1}): '$response'")
+            val version = parseBuildVersion(response)
+            if (version != null) return version
+            if (attempt == 0) Thread.sleep(100)
+        }
+        return null
     }
 
     private fun parseBuildVersion(response: String?): String? {
