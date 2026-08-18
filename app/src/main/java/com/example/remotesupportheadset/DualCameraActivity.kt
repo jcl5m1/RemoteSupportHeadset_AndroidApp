@@ -2360,11 +2360,19 @@ class DualCameraActivity : AppCompatActivity() {
     }
 
     private fun drainStaleInput(conn: UsbDeviceConnection, inEp: UsbEndpoint) {
+        // Use a short timeout for the common case where the CDC IN buffer is
+        // already empty. If stale data is present, bulkTransfer returns it
+        // immediately, so the loop still drains everything without paying the
+        // full 200 ms penalty on every capture.
         val chunk = ByteArray(1024)
+        val t0 = SystemClock.elapsedRealtime()
+        var drainedBytes = 0
         while (true) {
-            val len = conn.bulkTransfer(inEp, chunk, chunk.size, 200)
+            val len = conn.bulkTransfer(inEp, chunk, chunk.size, 50)
             if (len <= 0) break
+            drainedBytes += len
         }
+        Log.d(TAG, "drainStaleInput done: drained=${drainedBytes}B, took=${SystemClock.elapsedRealtime() - t0}ms")
     }
 
     private fun readLine(conn: UsbDeviceConnection, inEp: UsbEndpoint, buffer: ByteArrayOutputStream, deadline: Long): String? {

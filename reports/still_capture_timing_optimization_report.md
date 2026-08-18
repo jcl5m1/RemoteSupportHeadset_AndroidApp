@@ -152,10 +152,77 @@ Straightforward remaining options:
    still-capture pipeline. If it could resume UVC immediately after starting
    JPEG transfer, tap→resume would improve.
 
+## Follow-up optimization: faster CDC drain
+
+`dtDrain` was the next-largest Android-side cost at **206 ms**. The
+`drainStaleInput()` helper waited the full 200 ms bulk-transfer timeout on every
+capture even when the CDC IN buffer was empty.
+
+Changed `drainStaleInput()` to use a 50 ms timeout instead of 200 ms. When stale
+data is present, `bulkTransfer` returns it immediately and the loop continues;
+when the buffer is empty, the wait is now ~50 ms instead of ~200 ms.
+
+### Validation
+
+- Harness: `scripts/simulate_capture_lifecycle.py --count 30 --output-dir /tmp/simcap_drain --wait-min 3 --wait-max 5`
+- Output: `/tmp/simcap_drain/`
+
+| Metric | After Macbeth skip | After faster drain |
+|--------|-------------------|--------------------|
+| Mean tap→complete | 1322 ms | **1250 ms** |
+| Median tap→complete | 1408 ms | **1263 ms** |
+| p95 tap→complete | 1425 ms | **1285 ms** |
+| p99 tap→complete | 1432 ms | **1291 ms** |
+| Successes | 30 / 30 | **30 / 30** |
+| USB host recovery | 0 | **0** |
+
+### Drain per-phase breakdown
+
+| Phase | Mean | % of total |
+|-------|------|------------|
+| Total | 1247 ms | 100 % |
+| `dtCmdToLen` | 1089 ms | 87 % |
+| `dtDrain` | **53 ms** | 4 % |
+| `dtPayload` | 73 ms | 6 % |
+| `dtSave` | 20 ms | 2 % |
+| other | <3 ms each | <1 % |
+
+`dtDrain` dropped from 206 ms to **53 ms**, saving another ~150 ms per capture.
+
+### Histograms
+
+#### Tap to Capture Complete — drain optimized
+
+![Tap to Capture Complete](tap_to_complete_drain.png)
+
+#### Tap to Live Stream Resume — drain optimized
+
+![Tap to Live Stream Resume](tap_to_resume_drain.png)
+
+### Raw data
+
+- Events CSV: [`events_drain.csv`](events_drain.csv)
+- Per-phase timing CSV: [`timing_drain.csv`](timing_drain.csv)
+- Full logcat (local): `/tmp/simcap_drain/full_logcat.log`
+
+## USB stall inspection
+
+The original report raised outliers that correlated with USB stack stalls
+requiring unplug/replug. Re-inspecting the recent logs
+(`/tmp/simcap_100_v6` through `/tmp/simcap_drain`) shows **zero** full USB host
+recovery events (`RECOVER CAMERA`, `Camera health check FAILED`,
+`enableUsbDataSignal`, etc.) in any run after v6. The v8 and later builds
+handle transient CDC OUT stalls with in-place retry and never escalate to host
+port reset. The unplug/replug-class stalls appear to be eliminated.
+
 ## Conclusion
 
-Per-phase timing instrumentation showed that the Android-side `correctFullResJpeg()`
-step was wasting ~550 ms on captures with no Macbeth chart. Gating it on live
-preview chart detection cut the mean capture time by ~600 ms and made the
-tap→complete distribution tight (p95 ≈ 1.43 s). The next large reduction requires
-firmware-side work on `dtCmdToLen`.
+Two Android-side optimizations cut the mean capture time from ~1.93 s to
+**1.25 s** and p95 from ~1.98 s to **1.29 s**:
+
+1. Gating `correctFullResJpeg()` on live Macbeth chart detection saved ~550 ms.
+2. Reducing the CDC drain timeout from 200 ms to 50 ms saved another ~150 ms.
+
+The remaining ~1.1 s is dominated by `dtCmdToLen` on the ESP32-P4 firmware.
+That is now the only large reduction left, and it requires work in the
+firmware repo.
