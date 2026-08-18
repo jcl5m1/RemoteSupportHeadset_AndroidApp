@@ -117,6 +117,8 @@ class DualCameraActivity : AppCompatActivity() {
         const val EXTRA_CAPTURE_NOW = "capture_now"
         /** Intent extra that tags a simulated capture event with an index for timing stats. */
         const val EXTRA_SIMULATED_CAPTURE_INDEX = "simulated_capture_index"
+        /** Intent extra that tags a simulated video recording with an index for timing stats. */
+        const val EXTRA_SIMULATED_RECORD_INDEX = "simulated_record_index"
         /** Intent extra that runs the still-capture lifecycle test with the given count. */
         const val EXTRA_LIFECYCLE_TEST_COUNT = "lifecycle_test_count"
         /** Intent extra that runs capture→zoom→close cycles instead of plain captures. */
@@ -131,6 +133,14 @@ class DualCameraActivity : AppCompatActivity() {
         const val EXTRA_ANTI_BAND_HZ = "anti_band_hz"
         /** Intent extra that shows or hides the diagnostics panel. */
         const val EXTRA_DIAGNOSTICS = "diagnostics"
+        /** Intent extra that starts video recording. */
+        const val EXTRA_RECORD_START = "record_start"
+        /** Intent extra that stops video recording. */
+        const val EXTRA_RECORD_STOP = "record_stop"
+        /** Intent extra that auto-stops a recording started by [EXTRA_RECORD_START] after N milliseconds. */
+        const val EXTRA_RECORD_DURATION_MS = "record_duration_ms"
+        /** Intent extra that skips opening the gallery viewer after a recording stops. */
+        const val EXTRA_RECORD_NO_GALLERY = "record_no_gallery"
     }
 
     private lateinit var surfaceCamera: AspectRatioSurfaceView
@@ -280,7 +290,12 @@ class DualCameraActivity : AppCompatActivity() {
     private var currentSegmentIndex = 0
     private var currentRecordingFile: File? = null
     private var recordingStartTime = 0L
+    private var simulatedRecordStartTime = 0L
+    private var simulatedRecordIndex = -1
+    private var pendingSimRecResumedIndex = -1
+    private var pendingSimRecResumedStartTime = 0L
     private var pendingStartRecording = false
+    private var skipGalleryOnRecordingStop = false
 
     // Firmware flash state
     private var flashInProgress = false
@@ -357,6 +372,12 @@ class DualCameraActivity : AppCompatActivity() {
     private val fpsRunnable = object : Runnable {
         override fun run() {
             computeFps()
+            if (currentFps > 0 && pendingSimRecResumedIndex >= 0) {
+                val idx = pendingSimRecResumedIndex
+                val dt = SystemClock.elapsedRealtime() - pendingSimRecResumedStartTime
+                Log.i(TAG, "SIMREC resumed i=$idx t=${SystemClock.elapsedRealtime()} dt_resume=${dt}ms")
+                pendingSimRecResumedIndex = -1
+            }
             mainHandler.postDelayed(this, FPS_UPDATE_INTERVAL_MS)
         }
     }
@@ -1090,6 +1111,12 @@ class DualCameraActivity : AppCompatActivity() {
         recordingStartTime = System.currentTimeMillis()
         currentRecordingFile = getVideoOutputFile(currentSegmentIndex)
 
+        val idx = simulatedRecordIndex
+        simulatedRecordStartTime = SystemClock.elapsedRealtime()
+        if (idx >= 0) {
+            Log.i(TAG, "SIMREC start i=$idx t=${simulatedRecordStartTime}")
+        }
+
         val callback = object : ICaptureCallBack {
             override fun onBegin() {
                 Log.d(TAG, "Recording started: ${currentRecordingFile?.name}")
@@ -1190,6 +1217,17 @@ class DualCameraActivity : AppCompatActivity() {
             file.name.startsWith("VID_") && file.extension == "mp4" && file.lastModified() >= recordingStartTime
         }?.sortedBy { it.lastModified() } ?: emptyList()
 
+        val idx = simulatedRecordIndex
+        val success = sessionFiles.isNotEmpty()
+        if (idx >= 0) {
+            val dt = SystemClock.elapsedRealtime() - simulatedRecordStartTime
+            Log.i(TAG, "SIMREC complete i=$idx t=${SystemClock.elapsedRealtime()} dt_complete=${dt}ms success=$success file=${sessionFiles.lastOrNull()?.name ?: "none"}")
+            if (success) {
+                pendingSimRecResumedIndex = idx
+                pendingSimRecResumedStartTime = SystemClock.elapsedRealtime()
+            }
+        }
+
         if (sessionFiles.isEmpty()) {
             Toast.makeText(this, "Recording stopped (no files found)", Toast.LENGTH_LONG).show()
             return
@@ -1212,8 +1250,11 @@ class DualCameraActivity : AppCompatActivity() {
         Log.i(TAG, message)
         sessionFiles.forEach { Log.i(TAG, "  ${it.name} ${it.length()} bytes") }
 
-        // Open the most recent segment in the default gallery/photos app.
-        publicUris.lastOrNull()?.let { openVideoInGallery(it) }
+        // Open the most recent segment in the default gallery/photos app unless
+        // automation requested otherwise.
+        if (!skipGalleryOnRecordingStop) {
+            publicUris.lastOrNull()?.let { openVideoInGallery(it) }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -3721,6 +3762,27 @@ class DualCameraActivity : AppCompatActivity() {
             diagnosticsPanel.visibility = if (diagnosticsVisible) View.VISIBLE else View.GONE
             if (diagnosticsVisible) updateDiagnostics()
             Log.d(TAG, "EXTRA_DIAGNOSTICS=$diagnosticsVisible")
+        }
+
+        if (intent.getBooleanExtra(EXTRA_RECORD_START, false)) {
+            val durationMs = intent.getLongExtra(EXTRA_RECORD_DURATION_MS, 0L)
+            skipGalleryOnRecordingStop = intent.getBooleanExtra(EXTRA_RECORD_NO_GALLERY, false)
+            simulatedRecordIndex = intent.getIntExtra(EXTRA_SIMULATED_RECORD_INDEX, -1)
+            Log.d(TAG, "EXTRA_RECORD_START requested, durationMs=$durationMs, noGallery=$skipGalleryOnRecordingStop, index=${simulatedRecordIndex}")
+            startRecording()
+            if (durationMs > 0) {
+                mainHandler.postDelayed({
+                    stopRecording()
+                    skipGalleryOnRecordingStop = false
+                    simulatedRecordIndex = -1
+                }, durationMs)
+            }
+        }
+
+        if (intent.getBooleanExtra(EXTRA_RECORD_STOP, false)) {
+            Log.d(TAG, "EXTRA_RECORD_STOP requested")
+            stopRecording()
+            skipGalleryOnRecordingStop = false
         }
     }
 
