@@ -229,6 +229,7 @@ class DualCameraActivity : AppCompatActivity() {
     private var lastCapturedFile: File? = null
     private var lastCapturedThumbnail: android.graphics.Bitmap? = null
     private var lastAnnotatedFull: android.graphics.Bitmap? = null
+    private var lastLiveThumbnail: android.graphics.Bitmap? = null
     private var lastDebugPreviewSaveTime = 0L
     private val aprilTagDetector by lazy { AprilTagDetector() }
     private val aprilTagTracker = AprilTagTracker()
@@ -2245,13 +2246,13 @@ class DualCameraActivity : AppCompatActivity() {
                     else -> null
                 }
                 Log.d(TAG, "Anti-banding dialog selected index=$which -> forcedHz=$forcedHz")
-                val modeText = when (forcedHz) {
-                    50 -> "50 Hz"
-                    60 -> "60 Hz"
-                    else -> "auto-detect"
+                when (forcedHz) {
+                    50, 60 -> applyForcedAntiBanding(forcedHz)
+                    else -> {
+                        Toast.makeText(this, "Running anti-banding servo (auto-detect)", Toast.LENGTH_SHORT).show()
+                        startOrStopAntiBandingAnalysis(null)
+                    }
                 }
-                Toast.makeText(this, "Running anti-banding servo ($modeText)", Toast.LENGTH_SHORT).show()
-                startOrStopAntiBandingAnalysis(forcedHz)
             }
             .setNegativeButton("Cancel", null)
             .show()
@@ -2327,6 +2328,92 @@ class DualCameraActivity : AppCompatActivity() {
             }
             tool.start()
         }.apply { name = "AntiBandingStartupThread"; start() }
+    }
+
+    /**
+     * Fast-path anti-banding for a manually selected mains frequency. Instead of
+     * sweeping exposure, let the ESP32 AE converge, read its chosen exposure, and
+     * snap it to the nearest flicker null for [forcedHz]. This is immediate and
+     * does not show a progress dialog.
+     */
+    private fun applyForcedAntiBanding(forcedHz: Int) {
+        Log.d(TAG, "applyForcedAntiBanding forcedHz=$forcedHz")
+        Thread {
+            if (!waitForCdcReady(5000)) {
+                runOnUiThread {
+                    Toast.makeText(this, "CDC channel not ready", Toast.LENGTH_SHORT).show()
+                }
+                return@Thread
+            }
+
+            val helper = CdcCommandHelper(
+                this,
+                currentDevice,
+                currentCtrlBlock?.connection,
+                cdcOutEndpoint,
+                cdcInEndpoint
+            )
+            try {
+                if (!helper.open()) {
+                    runOnUiThread {
+                        Toast.makeText(this, "Failed to open CDC channel", Toast.LENGTH_SHORT).show()
+                    }
+                    return@Thread
+                }
+
+                helper.enableAutoExposure()
+                logAntiBanding("Waiting for AE to converge for $forcedHz Hz...")
+                Thread.sleep(1500)
+
+                val status = helper.queryExposureUs()
+                val currentUs = parseAntiBandingExpUs(status) ?: run {
+                    logAntiBanding("Failed to read current exposure")
+                    runOnUiThread {
+                        Toast.makeText(this, "Failed to read current exposure", Toast.LENGTH_SHORT).show()
+                    }
+                    return@Thread
+                }
+
+                val halfPeriodUs = 1_000_000 / (2 * forcedHz)
+                val nearestNull = (kotlin.math.round(currentUs / halfPeriodUs.toFloat()) * halfPeriodUs).toInt()
+
+                helper.disableAutoExposure()
+                Thread.sleep(200)
+                helper.setExposureUs(nearestNull)
+
+                cachedFlickerHz = forcedHz
+                lastAntiBandingFlickerHz = forcedHz
+                val summary = "Anti-banding set to $forcedHz Hz (${nearestNull} us, was ${currentUs.toInt()} us)"
+                logAntiBanding(summary)
+                Log.i("AntiBandResult", "FORCED_HZ=$forcedHz CURRENT_US=${currentUs.toInt()} SET_US=$nearestNull")
+
+                runOnUiThread {
+                    if (diagnosticsVisible) updateDiagnostics()
+                    Toast.makeText(this, summary, Toast.LENGTH_LONG).show()
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Forced anti-banding failed", e)
+                logAntiBanding("Forced anti-banding failed: ${e.message}")
+                runOnUiThread {
+                    Toast.makeText(this, "Anti-banding failed: ${e.message}", Toast.LENGTH_SHORT).show()
+                }
+            } finally {
+                helper.close()
+            }
+        }.apply { name = "AntiBandingForcedThread"; start() }
+    }
+
+    private fun logAntiBanding(message: String) {
+        Log.i(TAG, "Anti-banding: $message")
+    }
+
+    /**
+     * Parse an exposure value (microseconds) from an ESP32 `status` response.
+     */
+    private fun parseAntiBandingExpUs(response: String?): Float? {
+        if (response == null) return null
+        val match = Regex("""exp_us=([0-9.]+)""").find(response) ?: return null
+        return match.groupValues[1].toFloatOrNull()
     }
 
     private fun getVideoOutputFile(segmentIndex: Int): File {
@@ -2996,7 +3083,9 @@ class DualCameraActivity : AppCompatActivity() {
             zoomImage.setImageBitmap(bitmap)
             zoomOverlay.visibility = View.VISIBLE
             isZoomOpen = true
+            // Switch the thumbnail to a live-view preview and keep it updating.
             thumbnailUpdateHandler.post(thumbnailUpdateRunnable)
+            updateThumbnailWithLiveFrame()
         } catch (e: Exception) {
             Log.e(TAG, "Failed to load full image for zoom", e)
             Toast.makeText(this, "Failed to open image", Toast.LENGTH_SHORT).show()
@@ -3007,6 +3096,8 @@ class DualCameraActivity : AppCompatActivity() {
         isZoomOpen = false
         thumbnailUpdateHandler.removeCallbacks(thumbnailUpdateRunnable)
         zoomOverlay.visibility = View.GONE
+        lastLiveThumbnail?.takeIf { !it.isRecycled }?.recycle()
+        lastLiveThumbnail = null
         lastCapturedThumbnail?.let {
             thumbnailLastCapture.setImageBitmap(it)
         } ?: run {
@@ -3016,12 +3107,27 @@ class DualCameraActivity : AppCompatActivity() {
 
     /**
      * Copy the current live preview frame into the thumbnail ImageView.
-     * With SurfaceView preview this would require a full NV21→Bitmap conversion,
-     * so we leave the thumbnail showing the last captured still image.
+     * Called on a background handler while the still-image zoom overlay is open.
+     * The thumbnail then acts as a "return to live view" button; tapping it hides
+     * the zoom overlay and restores the still-image thumbnail.
      */
     private fun updateThumbnailWithLiveFrame() {
-        // SurfaceView does not expose a getBitmap() API. Live preview in the
-        // thumbnail is disabled to avoid GPU/CPU readback.
+        val full = peekLatestPreviewBitmap() ?: return
+        try {
+            val viewHeight = thumbnailLastCapture.height.coerceAtLeast(72)
+            val aspect = full.width.toFloat() / full.height.toFloat()
+            val viewWidth = (viewHeight * aspect).toInt().coerceAtLeast(1)
+            val thumbnail = Bitmap.createScaledBitmap(full, viewWidth, viewHeight, true)
+            runOnUiThread {
+                lastLiveThumbnail?.takeIf { !it.isRecycled }?.recycle()
+                lastLiveThumbnail = thumbnail
+                thumbnailLastCapture.setImageBitmap(thumbnail)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to update live thumbnail", e)
+        } finally {
+            full.recycle()
+        }
     }
 
     private fun queuePermissionRequest(device: UsbDevice) {
@@ -3421,6 +3527,16 @@ class DualCameraActivity : AppCompatActivity() {
      */
     private fun grabLatestPreviewBitmap(): Bitmap? {
         val frame = previewFrameQueue.poll() ?: return null
+        return nv21ToBitmap(frame.data, frame.width, frame.height)
+    }
+
+    /**
+     * Peek at the latest NV21 preview frame without removing it from the queue,
+     * and convert it to an ARGB Bitmap. Used for the live-view thumbnail while
+     * the still-image zoom overlay is open, so it does not starve AprilTag detection.
+     */
+    private fun peekLatestPreviewBitmap(): Bitmap? {
+        val frame = previewFrameQueue.peek() ?: return null
         return nv21ToBitmap(frame.data, frame.width, frame.height)
     }
 
@@ -3909,6 +4025,8 @@ class DualCameraActivity : AppCompatActivity() {
         antiBandingTool = null
         isZoomOpen = false
         thumbnailUpdateHandler.removeCallbacks(thumbnailUpdateRunnable)
+        lastLiveThumbnail?.takeIf { !it.isRecycled }?.recycle()
+        lastLiveThumbnail = null
         cameraClient?.unRegister()
         cameraClient?.destroy()
         try {
