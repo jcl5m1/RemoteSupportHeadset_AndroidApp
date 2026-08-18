@@ -206,6 +206,28 @@ class CdcCommandHelper(
         return sendCommand("auto")
     }
 
+    /**
+     * Force the firmware anti-banding flicker frequency. [hz] must be 50 or 60.
+     * Use [enableFlickerAutoDetection] to let the firmware auto-detect again.
+     */
+    fun setFlickerHz(hz: Int): String? {
+        return sendCommand("flicker $hz")
+    }
+
+    /**
+     * Let the firmware auto-detect 50/60 Hz flicker again.
+     */
+    fun enableFlickerAutoDetection(): String? {
+        return sendCommand("flicker auto")
+    }
+
+    /**
+     * Ask the firmware to report the current anti-banding flicker mode.
+     */
+    fun queryFlickerMode(): String? {
+        return sendCommand("flicker")
+    }
+
     fun sendCommand(cmd: String): String? {
         val rawConn = rawConnection
         val rawOut = rawOutEndpoint

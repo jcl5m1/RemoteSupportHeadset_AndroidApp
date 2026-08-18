@@ -148,6 +148,12 @@ class DualCameraActivity : AppCompatActivity() {
         private const val PREFS_NAME = "RemoteSupportHeadsetPrefs"
         /** SharedPreferences key for the live AprilTag detection toggle. */
         private const val PREF_APRILTAG_ENABLED = "apriltag_enabled"
+        /** SharedPreferences key for the forced flicker-frequency mode. */
+        private const val PREF_FLICKER_MODE = "flicker_mode"
+        /** Flicker mode values. */
+        private const val FLICKER_MODE_AUTO = "auto"
+        private const val FLICKER_MODE_50HZ = "50"
+        private const val FLICKER_MODE_60HZ = "60"
     }
 
     private lateinit var surfaceCamera: AspectRatioSurfaceView
@@ -277,6 +283,8 @@ class DualCameraActivity : AppCompatActivity() {
     private var aprilTagLastSummaryTime = 0L
     /** Whether live AprilTag detection (and its grayscale downsampling) is enabled. */
     private var aprilTagDetectionEnabled = false
+    /** Persisted flicker-frequency mode: "auto", "50", or "60". */
+    private var flickerMode = FLICKER_MODE_AUTO
 
     private val aprilTagRunnable = object : Runnable {
         override fun run() {
@@ -576,6 +584,12 @@ class DualCameraActivity : AppCompatActivity() {
             Log.d(TAG, "Live AprilTag detection disabled by default")
         }
 
+        // Load the persisted flicker-frequency preference. It is sent to the
+        // firmware once the CDC channel is ready.
+        flickerMode = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            .getString(PREF_FLICKER_MODE, FLICKER_MODE_AUTO) ?: FLICKER_MODE_AUTO
+        Log.d(TAG, "Flicker mode pref loaded: $flickerMode")
+
         // Tap anywhere on the preview to capture a still image (debounced)
         surfaceCamera.setOnTouchListener { _, event ->
             if (event.action == MotionEvent.ACTION_UP) {
@@ -692,7 +706,10 @@ class DualCameraActivity : AppCompatActivity() {
                     labelCamera.text = "${PREVIEW_WIDTH}x${PREVIEW_HEIGHT} @ -- FPS"
 
                     // Try to claim the CDC interface on the same composite device
-                    ctrlBlock?.let { setupCdc(device, it) }
+                    ctrlBlock?.let {
+                        setupCdc(device, it)
+                        applyPersistedFlickerMode()
+                    }
 
                     processNextPermission()
                 }
@@ -1968,6 +1985,10 @@ class DualCameraActivity : AppCompatActivity() {
             var success = true
             var message = "Firmware updated successfully"
             try {
+                // The ROM bootloader can take a moment to become ready after the
+                // USB enumeration. Give it time before starting the sync.
+                Thread.sleep(400)
+
                 val flasher = Esp32Flasher(connection, inEp, outEp)
                 for ((index, pair) in pendingFlashFiles.withIndex()) {
                     val (path, offset) = pair
@@ -2002,24 +2023,16 @@ class DualCameraActivity : AppCompatActivity() {
                 message = "Flash error: ${e.message}"
             }
 
-            if (success) {
-                // Reset the ESP32 so it boots from the newly flashed firmware.
-                controlInterface?.let { ctrl ->
-                    try {
-                        Log.d(TAG, "Resetting ESP32 via CDC control line state...")
-                        // Standard esptool reset sequence over CDC ACM: pulse RTS to reset.
-                        connection.controlTransfer(0x21, 0x22, 0x02, ctrl.id, null, 0, 1000) // RTS=1
-                        Thread.sleep(100)
-                        connection.controlTransfer(0x21, 0x22, 0x00, ctrl.id, null, 0, 1000) // RTS=0
-                        Thread.sleep(100)
-                        connection.controlTransfer(0x21, 0x22, 0x02, ctrl.id, null, 0, 1000) // RTS=1
-                        Thread.sleep(100)
-                        connection.controlTransfer(0x21, 0x22, 0x00, ctrl.id, null, 0, 1000) // RTS=0
-                        Thread.sleep(200)
-                        Log.d(TAG, "ESP32 reset sequence complete")
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Failed to reset ESP32: ${e.message}")
-                    }
+            // Always reset the ESP32 out of ROM download mode. On success this boots
+            // the new firmware; on failure it prevents the device from being left
+            // stuck in download mode, which confuses the Android USB host.
+            controlInterface?.let { ctrl ->
+                try {
+                    Log.d(TAG, "Resetting ESP32 via CDC control line state...")
+                    resetEsp32ViaControlLineState(connection, ctrl.id)
+                    Log.d(TAG, "ESP32 reset sequence complete")
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to reset ESP32: ${e.message}")
                 }
             }
 
@@ -2033,6 +2046,22 @@ class DualCameraActivity : AppCompatActivity() {
                 finishFlashFlow(success, message)
             }
         }.apply { name = "FlashSequenceThread"; start() }
+    }
+
+    /**
+     * Pulse RTS to reset the ESP32 out of ROM download mode and let it boot the
+     * application firmware. This is the same sequence esptool uses over CDC ACM.
+     */
+    private fun resetEsp32ViaControlLineState(connection: UsbDeviceConnection, controlInterfaceId: Int) {
+        // Standard esptool reset sequence over CDC ACM: pulse RTS to reset.
+        connection.controlTransfer(0x21, 0x22, 0x02, controlInterfaceId, null, 0, 1000) // RTS=1
+        Thread.sleep(100)
+        connection.controlTransfer(0x21, 0x22, 0x00, controlInterfaceId, null, 0, 1000) // RTS=0
+        Thread.sleep(100)
+        connection.controlTransfer(0x21, 0x22, 0x02, controlInterfaceId, null, 0, 1000) // RTS=1
+        Thread.sleep(100)
+        connection.controlTransfer(0x21, 0x22, 0x00, controlInterfaceId, null, 0, 1000) // RTS=0
+        Thread.sleep(200)
     }
 
     private fun showFlashProgress(message: String) {
@@ -2214,6 +2243,11 @@ class DualCameraActivity : AppCompatActivity() {
                         if (diagnosticsVisible) updateDiagnostics()
                         true
                     }
+                    R.id.action_flicker_frequency -> {
+                        Log.d(TAG, "Settings: flicker frequency selected")
+                        showFlickerFrequencyDialog()
+                        true
+                    }
                     R.id.action_anti_banding -> {
                         Log.d(TAG, "Settings: anti-banding selected")
                         showAntiBandingDialog()
@@ -2224,6 +2258,41 @@ class DualCameraActivity : AppCompatActivity() {
             }
             show()
         }
+    }
+
+    /**
+     * Show a dialog that lets the user choose the firmware anti-banding flicker
+     * frequency (auto / 50 Hz / 60 Hz). The choice is persisted and sent to the
+     * firmware on every camera connection.
+     */
+    private fun showFlickerFrequencyDialog() {
+        val options = arrayOf("Auto-detect", "50 Hz", "60 Hz")
+        val checked = when (flickerMode) {
+            FLICKER_MODE_50HZ -> 1
+            FLICKER_MODE_60HZ -> 2
+            else -> 0
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Flicker frequency")
+            .setSingleChoiceItems(options, checked) { dialog, which ->
+                val newMode = when (which) {
+                    1 -> FLICKER_MODE_50HZ
+                    2 -> FLICKER_MODE_60HZ
+                    else -> FLICKER_MODE_AUTO
+                }
+                if (newMode != flickerMode) {
+                    flickerMode = newMode
+                    getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                        .edit()
+                        .putString(PREF_FLICKER_MODE, newMode)
+                        .apply()
+                    Log.d(TAG, "Flicker mode changed to $newMode")
+                    applyPersistedFlickerMode()
+                }
+                dialog.dismiss()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     /**
@@ -2414,6 +2483,45 @@ class DualCameraActivity : AppCompatActivity() {
         if (response == null) return null
         val match = Regex("""exp_us=([0-9.]+)""").find(response) ?: return null
         return match.groupValues[1].toFloatOrNull()
+    }
+
+    /**
+     * Send the persisted flicker-frequency preference to the firmware once CDC is
+     * ready. Called after the camera connects so the firmware anti-banding uses
+     * the user's choice instead of its (sometimes wrong) auto-detection.
+     */
+    private fun applyPersistedFlickerMode() {
+        if (flickerMode == FLICKER_MODE_AUTO) {
+            Log.d(TAG, "Flicker mode is auto; not sending forced frequency")
+            return
+        }
+        val hz = flickerMode.toIntOrNull() ?: return
+        Log.d(TAG, "Applying persisted flicker mode: $hz Hz")
+        Thread {
+            if (!waitForCdcReady(5000)) {
+                Log.w(TAG, "Cannot apply flicker mode: CDC not ready")
+                return@Thread
+            }
+            val helper = CdcCommandHelper(
+                this,
+                currentDevice,
+                currentCtrlBlock?.connection,
+                cdcOutEndpoint,
+                cdcInEndpoint
+            )
+            try {
+                if (!helper.open()) {
+                    Log.w(TAG, "Cannot apply flicker mode: failed to open CDC")
+                    return@Thread
+                }
+                val response = helper.setFlickerHz(hz)
+                Log.i(TAG, "Flicker mode apply response: $response")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to apply flicker mode", e)
+            } finally {
+                helper.close()
+            }
+        }.apply { name = "FlickerApplyThread"; start() }
     }
 
     private fun getVideoOutputFile(segmentIndex: Int): File {
@@ -3810,6 +3918,7 @@ class DualCameraActivity : AppCompatActivity() {
         sb.appendLine("  Data IF:    ${if (cdcDataInterface != null) "yes" else "no"}")
         sb.appendLine("  Out EP:     ${if (cdcOutEndpoint != null) "yes" else "no"}")
         sb.appendLine("  In EP:      ${if (cdcInEndpoint != null) "yes" else "no"}")
+        sb.appendLine("  Flicker (app setting):  ${if (flickerMode == FLICKER_MODE_AUTO) "auto" else "$flickerMode Hz"}")
         sb.appendLine("  Flicker (firmware):     ${cachedFlickerHz?.let { "$it Hz" } ?: "unknown"}")
         sb.appendLine("  Flicker (anti-banding): ${lastAntiBandingFlickerHz?.let { "$it Hz" } ?: "not run"}")
 
