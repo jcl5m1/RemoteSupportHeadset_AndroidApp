@@ -2236,15 +2236,22 @@ class DualCameraActivity : AppCompatActivity() {
             existing.stop()
             return
         }
-        val options = arrayOf("Auto-detect flicker", "Force 50 Hz", "Force 60 Hz")
+        val options = arrayOf("Auto-detect mains frequency", "Assume 50 Hz mains", "Assume 60 Hz mains")
         AlertDialog.Builder(this)
-            .setTitle("Anti-banding analysis")
+            .setTitle("Run anti-banding servo")
             .setItems(options) { _, which ->
                 val forcedHz = when (which) {
                     1 -> 50
                     2 -> 60
                     else -> null
                 }
+                Log.d(TAG, "Anti-banding dialog selected index=$which -> forcedHz=$forcedHz")
+                val modeText = when (forcedHz) {
+                    50 -> "50 Hz"
+                    60 -> "60 Hz"
+                    else -> "auto-detect"
+                }
+                Toast.makeText(this, "Running anti-banding servo ($modeText)", Toast.LENGTH_SHORT).show()
                 startOrStopAntiBandingAnalysis(forcedHz)
             }
             .setNegativeButton("Cancel", null)
@@ -2260,6 +2267,7 @@ class DualCameraActivity : AppCompatActivity() {
      *   of relying on the ESP32's own flicker detection.
      */
     private fun startOrStopAntiBandingAnalysis(forcedHz: Int? = null) {
+        Log.d(TAG, "startOrStopAntiBandingAnalysis forcedHz=$forcedHz")
         val existing = antiBandingTool
         if (existing?.isRunning == true) {
             existing.stop()
