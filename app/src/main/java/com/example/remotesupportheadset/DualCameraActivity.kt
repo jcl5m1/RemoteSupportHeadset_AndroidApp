@@ -2864,8 +2864,9 @@ class DualCameraActivity : AppCompatActivity() {
         timings["saveRaw"] = tAfterRaw - t0
 
         // The full-resolution JPEG from the camera is landscape. Rotate it 90°
-        // counter-clockwise to portrait and, if the live preview recently saw a
-        // stable Macbeth chart, apply AWB / colour correction.
+        // counter-clockwise to portrait and apply AWB. If the live preview
+        // recently saw a stable Macbeth chart the chart white/grey patch is
+        // used; otherwise gray-world AWB is applied as a fallback.
         val macbethSeenRecently = SystemClock.elapsedRealtime() - lastMacbethFrameTime < MACBETH_CHART_RECENCY_MS
         processFullResJpeg(file, applyAwb = macbethSeenRecently, timings)
         val tAfterCorrect = SystemClock.elapsedRealtime()
@@ -2888,13 +2889,15 @@ class DualCameraActivity : AppCompatActivity() {
 
     /**
      * Decode the freshly saved full-resolution JPEG, rotate it 90°
-     * counter-clockwise to portrait, and apply AWB / colour correction derived
-     * from the Macbeth chart when [applyAwb] is true and all four 4x6 corner
-     * tags are detected. The file is overwritten with the processed image.
+     * counter-clockwise to portrait, and apply AWB / colour correction.
+     * When [applyAwb] is true and all four 4x6 Macbeth corner tags are detected,
+     * the white/grey patch of the chart is used. Otherwise a gray-world AWB
+     * estimate is applied so that normal scenes still get a neutral white
+     * balance. The file is overwritten with the processed image.
      * Large images (>24 MP) are skipped to avoid OOM.
      *
      * @param file The JPEG file to process.
-     * @param applyAwb Whether to attempt Macbeth AWB correction.
+     * @param applyAwb Whether to attempt Macbeth chart AWB correction first.
      * @param timings Mutable timing map; receives "correctFullRes".
      */
     private fun processFullResJpeg(file: File, applyAwb: Boolean, timings: MutableMap<String, Long>) {
@@ -2930,29 +2933,39 @@ class DualCameraActivity : AppCompatActivity() {
             val rotated = rotateBitmap90Ccw(original)
             original.recycle()
 
-            val processed = if (applyAwb) {
-                try {
+            val processed = try {
+                val chartGains = if (applyAwb) {
                     val detections = detectMacbeth4x6(rotated)
-                    val gains = if (detections.size >= 4) {
+                    if (detections.size >= 4) {
                         MacbethColorCorrector.estimateAwbGains(rotated, detections)
                     } else null
-                    if (gains != null && gains.all { it in 0.2f..5f }) {
-                        val corrected = MacbethColorCorrector.applyAwb(rotated, gains)
-                        rotated.recycle()
-                        awbApplied = true
-                        Log.i(TAG, "Applied AWB to ${file.name}: gains=${gains.contentToString()}")
-                        corrected
+                } else null
+
+                val gains = if (chartGains != null && chartGains.all { it in 0.2f..5f }) {
+                    Log.i(TAG, "Applying chart AWB to ${file.name}: gains=${chartGains.contentToString()}")
+                    chartGains
+                } else {
+                    // No Macbeth chart (or gains out of range) — fall back to gray-world AWB
+                    // so normal scenes still get a neutral white balance.
+                    val grayGains = MacbethColorCorrector.estimateGrayWorldAwbGains(rotated)
+                    if (grayGains != null) {
+                        Log.i(TAG, "Applying gray-world AWB to ${file.name}: gains=${grayGains.contentToString()}")
                     } else {
-                        if (gains != null) {
-                            Log.w(TAG, "AWB gains out of range for ${file.name}: ${gains.contentToString()}")
-                        }
-                        rotated
+                        Log.w(TAG, "Gray-world AWB failed for ${file.name}")
                     }
-                } catch (e: Exception) {
-                    Log.w(TAG, "AWB processing failed for ${file.name}", e)
+                    grayGains
+                }
+
+                if (gains != null && gains.all { it in 0.2f..5f }) {
+                    awbApplied = true
+                    val corrected = MacbethColorCorrector.applyAwb(rotated, gains)
+                    rotated.recycle()
+                    corrected
+                } else {
                     rotated
                 }
-            } else {
+            } catch (e: Exception) {
+                Log.w(TAG, "AWB processing failed for ${file.name}", e)
                 rotated
             }
 

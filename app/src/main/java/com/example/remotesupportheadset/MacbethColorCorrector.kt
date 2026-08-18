@@ -255,6 +255,46 @@ object MacbethColorCorrector {
     }
 
     /**
+     * Estimate diagonal AWB gains using a gray-world assumption. Pixels that are
+     * very dark or very bright are ignored so that saturated highlights and
+     * crushed shadows do not bias the estimate. The returned array is
+     * [rGain, gGain, bGain] with gGain pinned to 1.0 and red/blue gains clipped
+     * to a conservative range to avoid over-correction.
+     */
+    fun estimateGrayWorldAwbGains(bitmap: Bitmap): FloatArray? {
+        val w = bitmap.width
+        val h = bitmap.height
+        if (w <= 0 || h <= 0) return null
+        val pixels = IntArray(w * h)
+        bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
+        var rSum = 0L
+        var gSum = 0L
+        var bSum = 0L
+        var count = 0
+        for (c in pixels) {
+            val r = Color.red(c)
+            val g = Color.green(c)
+            val b = Color.blue(c)
+            // Ignore near-black and near-white pixels.
+            if (r > 12 && g > 12 && b > 12 && r < 245 && g < 245 && b < 245) {
+                rSum += r
+                gSum += g
+                bSum += b
+                count++
+            }
+        }
+        if (count == 0) return null
+        val rAvg = rSum / count.toFloat()
+        val gAvg = gSum / count.toFloat()
+        val bAvg = bSum / count.toFloat()
+        if (rAvg <= 0f || gAvg <= 0f || bAvg <= 0f) return null
+        val rGain = (gAvg / rAvg).coerceIn(0.5f, 2.0f)
+        val bGain = (gAvg / bAvg).coerceIn(0.5f, 2.0f)
+        Log.i(TAG, "Gray-world AWB gains: R=$rGain, B=$bGain (sampled $count pixels)")
+        return floatArrayOf(rGain, 1f, bGain)
+    }
+
+    /**
      * Apply diagonal AWB gains to every pixel of [bitmap] and return a new bitmap.
      * [gains] is [rGain, gGain, bGain]. The input bitmap is left untouched.
      */
