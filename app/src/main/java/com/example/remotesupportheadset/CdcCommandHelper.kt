@@ -1,6 +1,9 @@
 package com.example.remotesupportheadset
 
 import android.content.Context
+import android.hardware.usb.UsbDevice
+import android.hardware.usb.UsbDeviceConnection
+import android.hardware.usb.UsbEndpoint
 import android.hardware.usb.UsbManager
 import android.util.Log
 import com.hoho.android.usbserial.driver.UsbSerialDriver
@@ -10,37 +13,72 @@ import java.io.IOException
 import java.nio.charset.Charset
 
 /**
- * Opens the CDC-ACM serial port on the ESP32-P4 composite device and sends
- * runtime exposure commands for the anti-banding servo.
+ * Helper that sends text commands to the ESP32-P4 over CDC-ACM and reads the
+ * firmware's text responses. It can operate in two modes:
  *
- * This is separate from the UVC camera stack. The UVC library claims the video
- * interface; this helper tries to claim only the CDC-ACM interface on the same
- * device. If the UVC stack already has an exclusive device connection, the
- * helper will fail to open and commands will be skipped.
+ * 1. **Raw bulk-transfer mode** — used when the caller already owns the
+ *    [UsbDeviceConnection] and the CDC bulk endpoints (as the app does through
+ *    AndroidUSBCamera's USBMonitor). This avoids the interface-claiming
+ *    conflicts that prevent usb-serial-for-android from opening the port while
+ *    the UVC stack is active.
+ *
+ * 2. **usb-serial-for-android mode** — used as a fallback when no connection
+ *    is supplied. This requires the CDC interfaces to be unclaimed.
  */
-class CdcCommandHelper(context: Context) {
+class CdcCommandHelper(
+    context: Context,
+    private val preferredDevice: UsbDevice? = null,
+    private val preferredConnection: UsbDeviceConnection? = null,
+    private val preferredOutEndpoint: UsbEndpoint? = null,
+    private val preferredInEndpoint: UsbEndpoint? = null
+) {
 
     companion object {
         private const val TAG = "CdcCommandHelper"
         private const val VID_ESP = 0x303A
         private const val PID_CDC_UVC = 0x4022
         private const val BAUD = 115200
+        private const val BULK_TIMEOUT_MS = 500
     }
 
     private val usbManager: UsbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
     private var driver: UsbSerialDriver? = null
     private var port: UsbSerialPort? = null
+    private var ownedConnection: UsbDeviceConnection? = null
+
+    private var rawConnection: UsbDeviceConnection? = null
+    private var rawOutEndpoint: UsbEndpoint? = null
+    private var rawInEndpoint: UsbEndpoint? = null
 
     val isOpen: Boolean
-        get() = port != null
+        get() = port != null || rawConnection != null
 
     /**
-     * Try to open the first CDC port on the ESP32 device. Returns true on
-     * success. Must be called after the user has granted USB permission.
+     * Try to open the CDC port. Returns true on success. Must be called after
+     * the user has granted USB permission.
      */
     fun open(): Boolean {
         close()
 
+        // Prefer the raw connection/endpoints supplied by the caller.
+        val rawConn = preferredConnection
+        val rawOut = preferredOutEndpoint
+        val rawIn = preferredInEndpoint
+        if (rawConn != null && rawOut != null && rawIn != null) {
+            Log.d(TAG, "Using raw CDC bulk endpoints (out=${rawOut.address}, in=${rawIn.address})")
+            rawConnection = rawConn
+            rawOutEndpoint = rawOut
+            rawInEndpoint = rawIn
+            clearEndpointHalt(rawOut)
+            clearEndpointHalt(rawIn)
+            drainRawInput()
+            return true
+        }
+
+        return openViaUsbSerial()
+    }
+
+    private fun openViaUsbSerial(): Boolean {
         val availableDrivers = UsbSerialProber.getDefaultProber().findAllDrivers(usbManager)
         driver = availableDrivers.firstOrNull {
             it.device.vendorId == VID_ESP && it.device.productId == PID_CDC_UVC
@@ -63,10 +101,12 @@ class CdcCommandHelper(context: Context) {
             Log.w(TAG, "UsbManager.openDevice() returned null; another driver may already own the device")
             return false
         }
+        ownedConnection = connection
 
         val selectedPort = selectedDriver.ports.firstOrNull()
         if (selectedPort == null) {
             connection.close()
+            ownedConnection = null
             Log.w(TAG, "Driver reported no serial ports")
             return false
         }
@@ -83,6 +123,7 @@ class CdcCommandHelper(context: Context) {
                 selectedPort.close()
             } catch (_: IOException) { }
             connection.close()
+            ownedConnection = null
             false
         }
     }
@@ -95,6 +136,34 @@ class CdcCommandHelper(context: Context) {
                 p.close()
             } catch (_: IOException) { }
         }
+        if (ownedConnection != null) {
+            try {
+                ownedConnection?.close()
+            } catch (_: IOException) { }
+            ownedConnection = null
+        }
+        rawConnection = null
+        rawOutEndpoint = null
+        rawInEndpoint = null
+    }
+
+    private fun clearEndpointHalt(endpoint: UsbEndpoint) {
+        val conn = rawConnection ?: return
+        try {
+            val result = conn.controlTransfer(0x02, 1, 0, endpoint.address, null, 0, BULK_TIMEOUT_MS)
+            Log.d(TAG, "Cleared endpoint halt 0x${endpoint.address.toString(16)}: result=$result")
+        } catch (_: Exception) { }
+    }
+
+    private fun drainRawInput() {
+        val conn = rawConnection ?: return
+        val inEp = rawInEndpoint ?: return
+        val buf = ByteArray(256)
+        try {
+            while (conn.bulkTransfer(inEp, buf, buf.size, 50) > 0) {
+                // discard stale data
+            }
+        } catch (_: Exception) { }
     }
 
     /**
@@ -110,55 +179,16 @@ class CdcCommandHelper(context: Context) {
      * line, e.g. "BUILD_VERSION 20260817_123045", or null on failure.
      */
     fun queryBuildVersion(): String? {
-        val p = port ?: return null
-        return try {
-            drainInput(p)
-            val out = "version\r\n".toByteArray(Charset.forName("UTF-8"))
-            p.write(out, 500)
-            Thread.sleep(120)
-            readResponse(p)
-        } catch (e: IOException) {
-            Log.w(TAG, "CDC version query failed", e)
-            null
-        } catch (e: InterruptedException) {
-            Thread.currentThread().interrupt()
-            null
-        }
+        return sendCommand("version")
     }
 
     /**
      * Ask the firmware to report the current exposure register value and its
-     * duration in microseconds.
-     *
-     * We use the `status` command because it reports the live AE exposure
-     * (whether auto or manual).  The bare `exp_us` command only returns the
-     * last manually-set exposure value.  We also drain stale CDC input first
-     * so we don't pick up the response from a previous command.
+     * duration in microseconds. Uses the `status` command because it reports
+     * the live AE exposure (whether auto or manual).
      */
     fun queryExposureUs(): String? {
-        val p = port ?: return null
-        return try {
-            drainInput(p)
-            val out = "status\r\n".toByteArray(Charset.forName("UTF-8"))
-            p.write(out, 500)
-            Thread.sleep(120)
-            readResponse(p)
-        } catch (e: IOException) {
-            Log.w(TAG, "CDC status query failed", e)
-            null
-        } catch (e: InterruptedException) {
-            Thread.currentThread().interrupt()
-            null
-        }
-    }
-
-    private fun drainInput(port: UsbSerialPort) {
-        val buf = ByteArray(256)
-        try {
-            while (port.read(buf, 50) > 0) {
-                // discard stale data
-            }
-        } catch (_: IOException) { }
+        return sendCommand("status")
     }
 
     /**
@@ -177,12 +207,19 @@ class CdcCommandHelper(context: Context) {
     }
 
     fun sendCommand(cmd: String): String? {
+        val rawConn = rawConnection
+        val rawOut = rawOutEndpoint
+        val rawIn = rawInEndpoint
+        if (rawConn != null && rawOut != null && rawIn != null) {
+            return sendRaw(rawConn, rawOut, rawIn, cmd)
+        }
+
         val p = port ?: return null
         return try {
+            drainInput(p)
             val out = "$cmd\r\n".toByteArray(Charset.forName("UTF-8"))
             p.write(out, 500)
-            // Give the firmware a moment to echo/answer.
-            Thread.sleep(60)
+            Thread.sleep(80)
             readResponse(p)
         } catch (e: IOException) {
             Log.w(TAG, "CDC write failed for '$cmd'", e)
@@ -191,6 +228,52 @@ class CdcCommandHelper(context: Context) {
             Thread.currentThread().interrupt()
             null
         }
+    }
+
+    private fun sendRaw(
+        conn: UsbDeviceConnection,
+        outEp: UsbEndpoint,
+        inEp: UsbEndpoint,
+        cmd: String
+    ): String? {
+        return try {
+            drainRawInput()
+            val out = "$cmd\r\n".toByteArray(Charset.forName("UTF-8"))
+            val written = conn.bulkTransfer(outEp, out, out.size, BULK_TIMEOUT_MS)
+            if (written < 0) {
+                Log.w(TAG, "Raw CDC OUT bulkTransfer failed for '$cmd': $written")
+                return null
+            }
+            Thread.sleep(80)
+            readRawResponse(conn, inEp)
+        } catch (e: Exception) {
+            Log.w(TAG, "Raw CDC command failed for '$cmd'", e)
+            null
+        }
+    }
+
+    private fun readRawResponse(conn: UsbDeviceConnection, inEp: UsbEndpoint): String? {
+        val buf = ByteArray(256)
+        return try {
+            val n = conn.bulkTransfer(inEp, buf, buf.size, BULK_TIMEOUT_MS)
+            if (n > 0) {
+                String(buf, 0, n, Charset.forName("UTF-8")).trim()
+            } else {
+                ""
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Raw CDC read failed", e)
+            null
+        }
+    }
+
+    private fun drainInput(port: UsbSerialPort) {
+        val buf = ByteArray(256)
+        try {
+            while (port.read(buf, 50) > 0) {
+                // discard stale data
+            }
+        } catch (_: IOException) { }
     }
 
     private fun readResponse(port: UsbSerialPort): String? {

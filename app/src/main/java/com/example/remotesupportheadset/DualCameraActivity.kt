@@ -125,6 +125,8 @@ class DualCameraActivity : AppCompatActivity() {
         const val EXTRA_ZOOM_OPEN = "zoom_open"
         /** Intent extra that closes the zoom overlay. */
         const val EXTRA_ZOOM_CLOSE = "zoom_close"
+        /** Intent extra that starts the anti-banding exposure servo immediately. */
+        const val EXTRA_ANTI_BAND_NOW = "anti_band_now"
     }
 
     private lateinit var surfaceCamera: AspectRatioSurfaceView
@@ -232,9 +234,6 @@ class DualCameraActivity : AppCompatActivity() {
     // spend CPU time running full-res Macbeth detection / AWB on a still capture.
     private val MACBETH_CHART_RECENCY_MS = 30000L
 
-    // Runtime CDC command helper (used by analysis tools and still-capture helpers).
-    private val cdcCommandHelper by lazy { CdcCommandHelper(this) }
-
     // Anti-banding servo; created on demand from the settings menu.
     private var antiBandingTool: AntiBandingTool? = null
 
@@ -299,10 +298,10 @@ class DualCameraActivity : AppCompatActivity() {
             // usb-serial-for-android.  Concurrent CDC traffic while a still
             // capture is running has been observed to stall the capture's own
             // CDC OUT bulkTransfer, so skip the query until the capture ends.
-            if (!isCapturing) {
-                queryFirmwareBuildVersion()
+            if (isCapturing || antiBandingTool?.isRunning == true) {
+                Log.v(TAG, "Firmware version query skipped: ${if (isCapturing) "capture in progress" else "anti-banding in progress"}")
             } else {
-                Log.v(TAG, "Firmware version query skipped: capture in progress")
+                queryFirmwareBuildVersion()
             }
             mainHandler.postDelayed(this, FIRMWARE_VERSION_INTERVAL_MS)
         }
@@ -1215,7 +1214,7 @@ class DualCameraActivity : AppCompatActivity() {
 
     private fun queryFirmwareBuildVersion() {
         Thread {
-            val helper = CdcCommandHelper(this)
+            val helper = CdcCommandHelper(this, currentDevice, currentCtrlBlock?.connection, cdcOutEndpoint, cdcInEndpoint)
             val version = try {
                 if (helper.open()) {
                     val response = helper.queryBuildVersion()
@@ -2149,40 +2148,56 @@ class DualCameraActivity : AppCompatActivity() {
             return
         }
 
-        val tool = AntiBandingTool(
-            activity = this,
-            cdcCommandHelper = cdcCommandHelper,
-            frameProvider = { grabLatestPreviewBitmap() }
-        ).also { antiBandingTool = it }
-
         val dialog = AlertDialog.Builder(this)
             .setTitle("Anti-banding analysis")
-            .setMessage("Starting...")
+            .setMessage("Waiting for CDC channel...")
             .setCancelable(false)
             .setNegativeButton("Stop") { _, _ ->
-                tool.stop()
+                antiBandingTool?.stop()
             }
             .show()
 
-        tool.onLog = { message ->
-            dialog.setMessage(message)
-        }
-        tool.onResult = { result ->
-            runOnUiThread {
-                dialog.setMessage(
-                    "Done.\nFlicker: ${result.flickerHz} Hz\n" +
-                            "ESP32 exposure: ${result.esp32Us.toInt()} us\n" +
-                            "Android servo: ${result.androidUs} us\n" +
-                            "Metric: %.4f".format(result.androidMetric) + "\n" +
-                            "Mean intensity: %.1f".format(result.androidMean)
-                )
-                dialog.setButton(AlertDialog.BUTTON_NEGATIVE, "Close") { _, _ ->
-                    tool.stop()
-                    dialog.dismiss()
+        Thread {
+            if (!waitForCdcReady(5000)) {
+                runOnUiThread {
+                    dialog.setMessage("CDC channel not ready. Try again after the camera is fully connected.")
+                    dialog.setButton(AlertDialog.BUTTON_NEGATIVE, "Close") { _, _ -> dialog.dismiss() }
+                }
+                return@Thread
+            }
+
+            val tool = AntiBandingTool(
+                activity = this,
+                cdcCommandHelper = CdcCommandHelper(
+                    this,
+                    currentDevice,
+                    currentCtrlBlock?.connection,
+                    cdcOutEndpoint,
+                    cdcInEndpoint
+                ),
+                frameProvider = { grabLatestPreviewBitmap() }
+            ).also { antiBandingTool = it }
+
+            tool.onLog = { message ->
+                runOnUiThread { dialog.setMessage(message) }
+            }
+            tool.onResult = { result ->
+                runOnUiThread {
+                    dialog.setMessage(
+                        "Done.\nFlicker: ${result.flickerHz} Hz\n" +
+                                "ESP32 exposure: ${result.esp32Us.toInt()} us\n" +
+                                "Android servo: ${result.androidUs} us\n" +
+                                "Metric: %.4f".format(result.androidMetric) + "\n" +
+                                "Mean intensity: %.1f".format(result.androidMean)
+                    )
+                    dialog.setButton(AlertDialog.BUTTON_NEGATIVE, "Close") { _, _ ->
+                        tool.stop()
+                        dialog.dismiss()
+                    }
                 }
             }
-        }
-        tool.start()
+            tool.start()
+        }.apply { name = "AntiBandingStartupThread"; start() }
     }
 
     private fun getVideoOutputFile(segmentIndex: Int): File {
@@ -3638,6 +3653,10 @@ class DualCameraActivity : AppCompatActivity() {
         if (intent.getBooleanExtra(EXTRA_ZOOM_CLOSE, false)) {
             Log.d(TAG, "EXTRA_ZOOM_CLOSE requested")
             hideZoomOverlay()
+        }
+        if (intent.getBooleanExtra(EXTRA_ANTI_BAND_NOW, false)) {
+            Log.d(TAG, "EXTRA_ANTI_BAND_NOW requested")
+            startOrStopAntiBandingAnalysis()
         }
     }
 
