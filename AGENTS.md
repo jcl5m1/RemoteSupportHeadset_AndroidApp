@@ -114,6 +114,9 @@ The application runtime is contained mostly in `DualCameraActivity.kt`. The main
 - Two JNI shared libraries are built by CMake:
   - `libapriltag_jni.so` — exposes `AprilTagDetector.nativeDetect(Bitmap)`.
   - `libesp32flasher.so` — exposes `Esp32Flasher.nativeFlash(...)` for USB-CDC flashing.
+- All native libraries are forced to 16 KB ELF alignment for Android 15+:
+  - CMake links our shared libraries with `-Wl,-z,max-page-size=16384`.
+  - A Gradle hook runs `scripts/patch_elf_16kb.py` on the merged native libs directory after `mergeDebugNativeLibs` / `mergeReleaseNativeLibs`, upgrading any 4 KB aligned prebuilt `.so` files from AAR dependencies.
 
 ## Build commands
 
@@ -146,7 +149,7 @@ You can also open the project in Android Studio and let it sync Gradle automatic
 
 The agent environment in this workspace is set up to build and deploy the Android app directly. All required tools (JDK, Android SDK, ADB) are installed and available, so agents can and should build, install, and restart the app without claiming any are missing.
 
-- **JDK**: OpenJDK 26 is installed via Homebrew. `JAVA_HOME` is exported in `~/.zshrc`, `~/.bash_profile`, and `~/.bashrc` pointing to the stable Homebrew symlink `/opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home`, which tracks version updates. `java` and `javac` are also symlinked into `~/.local/bin` so they are on `PATH` even for non-interactive shells, and `org.gradle.java.home` is set in `gradle.properties` as a fallback.
+- **JDK**: OpenJDK 17 (LTS) is used for the Gradle build. OpenJDK 26 is installed on the host, but Gradle 8.13 / AGP 8.13 fail to evaluate the build scripts under JDK 26 (Groovy's bundled ASM rejects Java 26 class files, major version 70), so `org.gradle.java.home` in `gradle.properties` is pinned to `/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home`. The app itself is still compiled to Java 8 bytecode (`sourceCompatibility` / `targetCompatibility` `VERSION_1_8`, Kotlin `jvmTarget = '1.8'`).
 - **Android SDK**: Command-line tools are installed at `/opt/homebrew/share/android-commandlinetools` and referenced by `local.properties` (`sdk.dir=...`).
 - **NDK**: The Android NDK required by the CMake build is bundled with the command-line tools / SDK and referenced via `ndkVersion` in `app/build.gradle`.
 - **ADB**: `adb` is on `PATH` at `/opt/homebrew/bin/adb`; one or more physical devices are normally attached over ADB.

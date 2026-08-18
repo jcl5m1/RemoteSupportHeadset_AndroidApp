@@ -81,3 +81,22 @@ dependencies {
 }
 
 apply from: 'test.gradle'
+
+// Android 15+ requires all native libraries to be 16 KB ELF aligned.
+// Our CMake-built libraries are linked with max-page-size=16384, but AAR
+// dependencies may still ship 4 KB aligned .so files. Patch the merged
+// native libs directory after merge so the final APK/stripped libs are
+// aligned regardless of their source.
+tasks.whenTaskAdded { task ->
+    if (task.name == 'mergeDebugNativeLibs' || task.name == 'mergeReleaseNativeLibs') {
+        task.doLast {
+            def variant = task.name == 'mergeDebugNativeLibs' ? 'debug' : 'release'
+            def libDir = file("${buildDir}/intermediates/merged_native_libs/${variant}/${task.name}/out/lib")
+            if (libDir.exists()) {
+                exec {
+                    commandLine("python3", "${rootProject.projectDir}/scripts/patch_elf_16kb.py", libDir.absolutePath)
+                }
+            }
+        }
+    }
+}

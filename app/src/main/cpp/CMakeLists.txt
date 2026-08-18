@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.22.1)
 project("esp32flasher")
 
+# Android 15+ requires 16 KB ELF page alignment for native libraries.
+set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,max-page-size=16384")
+
 # AprilTag3 detector (16h5 only)
 add_subdirectory(apriltag)
 
