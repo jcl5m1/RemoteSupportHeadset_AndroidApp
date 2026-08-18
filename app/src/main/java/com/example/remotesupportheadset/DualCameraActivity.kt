@@ -3022,8 +3022,10 @@ class DualCameraActivity : AppCompatActivity() {
         // counter-clockwise to portrait and apply AWB. If the live preview
         // recently saw a stable Macbeth chart the chart white/grey patch is
         // used; otherwise gray-world AWB is applied as a fallback.
+        // AprilTag-based chart detection is skipped entirely when the pipeline
+        // is disabled, so only the gray-world fallback runs then.
         val macbethSeenRecently = SystemClock.elapsedRealtime() - lastMacbethFrameTime < MACBETH_CHART_RECENCY_MS
-        processFullResJpeg(file, applyAwb = macbethSeenRecently, timings)
+        processFullResJpeg(file, applyAwb = aprilTagDetectionEnabled && macbethSeenRecently, timings)
         val tAfterCorrect = SystemClock.elapsedRealtime()
         if (!timings.containsKey("correct")) {
             timings["correct"] = tAfterCorrect - tAfterRaw
@@ -3194,11 +3196,17 @@ class DualCameraActivity : AppCompatActivity() {
                 val bitmap = BitmapFactory.decodeFile(file.absolutePath, decodeOptions)
                     ?: return@Thread
 
-                // Detect AprilTags and draw overlays on the decoded image.
-                val (detections, annotated) = try {
-                    aprilTagDetector.detect(bitmap, annotate = true)
-                } catch (e: Exception) {
-                    Log.e(TAG, "AprilTag detection failed", e)
+                // Detect AprilTags and draw overlays on the decoded image only when
+                // the AprilTag video-processing pipeline is enabled.  When disabled,
+                // the still image and thumbnail are shown without tag overlays.
+                val (detections, annotated) = if (aprilTagDetectionEnabled) {
+                    try {
+                        aprilTagDetector.detect(bitmap, annotate = true)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "AprilTag detection failed", e)
+                        emptyList<AprilTagDetector.Detection>() to null
+                    }
+                } else {
                     emptyList<AprilTagDetector.Detection>() to null
                 }
                 if (detections.isNotEmpty()) {
