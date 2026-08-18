@@ -1,0 +1,216 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/root_layout"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="horizontal"
+    android:background="#000000">
+
+    <!-- Camera preview area fills the left side of the landscape display. -->
+    <FrameLayout
+        android:id="@+id/camera_container"
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1"
+        android:background="#000000">
+
+        <com.jiangdg.ausbc.widget.AspectRatioSurfaceView
+            android:id="@+id/surface_camera"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:layout_gravity="center" />
+
+        <com.example.remotesupportheadset.AprilTagOverlayView
+            android:id="@+id/apriltag_overlay"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:layout_gravity="center" />
+
+        <TextView
+            android:id="@+id/label_camera"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="top|start"
+            android:padding="12dp"
+            android:text="Waiting..."
+            android:textColor="#FFFFFF"
+            android:textSize="14sp"
+            android:background="#88888888" />
+
+        <TextView
+            android:id="@+id/status_camera"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:gravity="center"
+            android:text="Waiting for camera..."
+            android:textColor="#FFFFFF"
+            android:textSize="18sp" />
+
+        <TextView
+            android:id="@+id/tap_hint"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="bottom|center_horizontal"
+            android:layout_marginBottom="48dp"
+            android:padding="12dp"
+            android:text="Tap video to capture still image"
+            android:textColor="#FFFFFF"
+            android:textSize="16sp"
+            android:background="#80000000" />
+
+        <!-- Diagnostics overlay -->
+        <ScrollView
+            android:id="@+id/diagnostics_panel"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:background="#E6000000"
+            android:visibility="gone"
+            android:padding="12dp">
+
+            <TextView
+                android:id="@+id/diagnostics_text"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textColor="#00FF00"
+                android:textSize="12sp"
+                android:fontFamily="monospace"
+                android:text="Diagnostics..." />
+        </ScrollView>
+
+    </FrameLayout>
+
+    <!-- Right-side control strip in landscape orientation. -->
+    <LinearLayout
+        android:id="@+id/thumbnail_container"
+        android:layout_width="wrap_content"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:background="#111111"
+        android:padding="8dp"
+        android:gravity="center">
+
+        <ImageView
+            android:id="@+id/thumbnail_last_capture"
+            android:layout_width="wrap_content"
+            android:layout_height="72dp"
+            android:adjustViewBounds="true"
+            android:scaleType="fitCenter"
+            android:background="#333333"
+            android:contentDescription="Last captured image" />
+
+        <TextView
+            android:id="@+id/thumbnail_label"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text=""
+            android:visibility="gone"
+            android:textColor="#AAAAAA"
+            android:textSize="12sp" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="12dp"
+            android:layout_marginBottom="12dp"
+            android:background="#444444" />
+
+        <!-- Settings and record controls -->
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:gravity="center">
+
+            <Button
+                android:id="@+id/settings_button"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:minWidth="80dp"
+                android:text="Settings"
+                android:textSize="11sp"
+                android:paddingHorizontal="8dp"
+                android:backgroundTint="#444444"
+                android:textColor="#FFFFFF" />
+
+            <Button
+                android:id="@+id/record_toggle"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:layout_marginTop="4dp"
+                android:minWidth="80dp"
+                android:text="Record"
+                android:textSize="11sp"
+                android:paddingHorizontal="8dp"
+                android:backgroundTint="#AA3333"
+                android:textColor="#FFFFFF" />
+
+            <TextView
+                android:id="@+id/firmware_version_label"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:minWidth="80dp"
+                android:text="FW: --"
+                android:textColor="#AAAAAA"
+                android:textSize="10sp"
+                android:gravity="center"
+                android:visibility="visible" />
+        </LinearLayout>
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="12dp"
+            android:layout_marginBottom="12dp"
+            android:background="#444444" />
+
+        <!-- MIC/SPK meters -->
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:gravity="center">
+
+            <TextView
+                android:id="@+id/mic_level_label"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="MIC: -- dB"
+                android:textColor="#AAAAAA"
+                android:textSize="12sp" />
+
+            <ProgressBar
+                android:id="@+id/mic_level_meter"
+                style="?android:attr/progressBarStyleHorizontal"
+                android:layout_width="80dp"
+                android:layout_height="16dp"
+                android:layout_marginTop="4dp"
+                android:max="100"
+                android:progress="0"
+                android:progressDrawable="@drawable/vu_meter_drawable" />
+
+            <TextView
+                android:id="@+id/spk_level_label"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="SPK: -- dB"
+                android:textColor="#AAAAAA"
+                android:textSize="12sp" />
+
+            <ProgressBar
+                android:id="@+id/spk_level_meter"
+                style="?android:attr/progressBarStyleHorizontal"
+                android:layout_width="80dp"
+                android:layout_height="16dp"
+                android:layout_marginTop="4dp"
+                android:max="100"
+                android:progress="0"
+                android:progressDrawable="@drawable/vu_meter_drawable" />
+        </LinearLayout>
+    </LinearLayout>
+
+</LinearLayout>

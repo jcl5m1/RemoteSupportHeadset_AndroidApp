@@ -17,7 +17,8 @@ Key user-facing behavior:
 - Displays live MIC and SPK level meters at the bottom.
 - Provides a single **Record** button that toggles video recording on/off; finished videos and still JPEGs are published to public MediaStore albums (`Pictures/RemoteSupportHeadset` and `Movies/RemoteSupportHeadset`) that Google Photos syncs automatically.
 - The bottom thumbnail shows the most recent photo or video from the synced album; tapping it opens Google Photos (or the system's viewer) to that item.
-- Provides a **Settings** popup with **Update firmware** (download from a URL and reflash ESP32-P4), **Show diagnostics**, **AprilTag detection**, and **Person detection** options.
+- Provides a **Settings** popup with **Update firmware** (download from a URL and reflash ESP32-P4), **Show diagnostics**, **AprilTag detection**, **Person detection**, and **Landscape mode** options.
+- **Landscape mode** (default off) locks the activity to landscape orientation, uses a dedicated landscape layout (camera preview on the left filling the display height, control strip on the right), and scales the camera preview so its vertical dimension matches the landscape display height.
 - Runs AprilTag detection on the live preview only when enabled in Settings; it defaults to off. When enabled, detected tags are overlaid and a colour-correction matrix can be computed from a Macbeth chart.
 - Runs YOLOv8n person detection on the live preview only when enabled in Settings; it defaults to off. When enabled, person bounding boxes are overlaid on the live stream and burned into saved still JPEGs.
 - Runs YOLOv8n person detection on the live preview only when enabled in Settings; it defaults to off. When enabled, person bounding boxes are overlaid on the live stream and burned into saved still JPEGs.

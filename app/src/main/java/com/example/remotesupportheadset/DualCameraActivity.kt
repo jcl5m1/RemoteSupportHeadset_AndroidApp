@@ -44,6 +44,7 @@ import android.view.WindowManager
 import android.util.Log
 import android.util.Size
 import androidx.exifinterface.media.ExifInterface
+import android.content.pm.ActivityInfo
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.View
@@ -159,6 +160,8 @@ class DualCameraActivity : AppCompatActivity() {
         private const val PREF_FLICKER_MODE = "flicker_mode"
         /** SharedPreferences key for the video test source frame directory. */
         private const val PREF_VIDEO_TEST_PATH = "video_test_path"
+        /** SharedPreferences key for the landscape-mode toggle. */
+        private const val PREF_LANDSCAPE_MODE = "landscape_mode"
         /** Default on-device directory for video test source frames. */
         private const val DEFAULT_VIDEO_TEST_PATH = "/sdcard/Android/data/com.example.remotesupportheadset/files/TestFrames/"
         /** Flicker mode values. */
@@ -240,6 +243,11 @@ class DualCameraActivity : AppCompatActivity() {
     // Horizontal mirror of the live preview. Some UVC modules deliver a left-right mirrored
     // stream; toggling this mirrors the preview surface so the on-screen preview looks correct.
     private var cameraPreviewMirrorH = false
+
+    // Landscape mode locks the activity to landscape orientation and uses the
+    // landscape layout where the camera preview fills the left side and the
+    // control strip sits on the right.
+    private var landscapeMode = false
 
     private var lastCapturedMediaUri: Uri? = null
     private var lastCapturedThumbnail: android.graphics.Bitmap? = null
@@ -601,6 +609,14 @@ class DualCameraActivity : AppCompatActivity() {
     @SuppressLint("ClickableViewAccessibility")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Landscape mode locks the activity to landscape orientation and loads
+        // the landscape layout. Apply this before setContentView() so the correct
+        // layout resource is chosen.
+        landscapeMode = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            .getBoolean(PREF_LANDSCAPE_MODE, false)
+        applyLandscapeMode()
+
         setContentView(R.layout.activity_dual_camera)
 
         hideSystemUI()
@@ -642,6 +658,8 @@ class DualCameraActivity : AppCompatActivity() {
             diagnosticsVisible = false
             diagnosticsPanel.visibility = View.GONE
         }
+
+        Log.d(TAG, "Landscape mode pref loaded: enabled=$landscapeMode")
 
         // Live AprilTag detection is part of the optional video-processing pipeline.
         // It defaults to off and can be toggled from Settings.
@@ -1017,7 +1035,7 @@ class DualCameraActivity : AppCompatActivity() {
      * Recovery is throttled to avoid tight restart loops.
      */
     private fun recoverCamera() {
-        if (isFinishing) return
+        if (isFinishing || isDestroyed) return
         val now = SystemClock.elapsedRealtime()
         if (now - lastRecoveryTime < 15000L) {
             Log.d(TAG, "Recovery throttled, last attempt ${now - lastRecoveryTime}ms ago")
@@ -2522,6 +2540,7 @@ class DualCameraActivity : AppCompatActivity() {
             menu.findItem(R.id.action_diagnostics)?.isChecked = diagnosticsVisible
             menu.findItem(R.id.action_enable_apriltag)?.isChecked = aprilTagDetectionEnabled
             menu.findItem(R.id.action_enable_yolo)?.isChecked = yoloDetectionEnabled
+            menu.findItem(R.id.action_landscape_mode)?.isChecked = landscapeMode
             menu.findItem(R.id.action_anti_banding)?.title =
                 if (antiBandingTool?.isRunning == true) "Stop anti-banding" else "Anti-banding analysis"
             setOnMenuItemClickListener { item ->
@@ -2564,6 +2583,18 @@ class DualCameraActivity : AppCompatActivity() {
                     R.id.action_video_test_source -> {
                         Log.d(TAG, "Settings: video test source selected")
                         showVideoTestSourceDialog()
+                        true
+                    }
+                    R.id.action_landscape_mode -> {
+                        Log.d(TAG, "Settings: landscape mode selected")
+                        landscapeMode = !landscapeMode
+                        getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                            .edit()
+                            .putBoolean(PREF_LANDSCAPE_MODE, landscapeMode)
+                            .apply()
+                        applyLandscapeMode()
+                        // The orientation change triggered by setRequestedOrientation
+                        // will recreate the activity and load the correct layout.
                         true
                     }
                     else -> false
@@ -3656,6 +3687,21 @@ class DualCameraActivity : AppCompatActivity() {
     }
 
     /**
+     * Apply the Android-level landscape-mode setting. When enabled the activity is
+     * locked to landscape and the landscape layout is used (camera preview on the
+     * left, control strip on the right). When disabled the activity returns to
+     * portrait.
+     */
+    private fun applyLandscapeMode() {
+        requestedOrientation = if (landscapeMode) {
+            ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+        } else {
+            ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        }
+        Log.d(TAG, "Applied landscape mode: enabled=$landscapeMode, orientation=$requestedOrientation")
+    }
+
+    /**
      * Start the background thread that runs AprilTag detection on the live
      * preview bitmap and updates [aprilTagOverlay].
      */
@@ -4641,6 +4687,10 @@ class DualCameraActivity : AppCompatActivity() {
         lastCapturedThumbnail = null
         cameraClient?.unRegister()
         cameraClient?.destroy()
+        cameraClient = null
+        currentCamera = null
+        currentDevice = null
+        currentCtrlBlock = null
         try {
             wakeLock?.release()
             Log.d(TAG, "Wake lock released")
