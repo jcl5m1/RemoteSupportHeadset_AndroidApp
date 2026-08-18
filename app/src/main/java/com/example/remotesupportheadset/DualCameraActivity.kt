@@ -141,6 +141,13 @@ class DualCameraActivity : AppCompatActivity() {
         const val EXTRA_RECORD_DURATION_MS = "record_duration_ms"
         /** Intent extra that skips opening the gallery viewer after a recording stops. */
         const val EXTRA_RECORD_NO_GALLERY = "record_no_gallery"
+        /** Intent extra that enables or disables live AprilTag detection (overrides the saved preference). */
+        const val EXTRA_APRILTAG_ENABLED = "apriltag_enabled"
+
+        /** SharedPreferences file used for persistent app settings. */
+        private const val PREFS_NAME = "RemoteSupportHeadsetPrefs"
+        /** SharedPreferences key for the live AprilTag detection toggle. */
+        private const val PREF_APRILTAG_ENABLED = "apriltag_enabled"
     }
 
     private lateinit var surfaceCamera: AspectRatioSurfaceView
@@ -262,6 +269,8 @@ class DualCameraActivity : AppCompatActivity() {
     private var aprilTagHandler: Handler? = null
     private var aprilTagCycleCount = 0L
     private var aprilTagLastSummaryTime = 0L
+    /** Whether live AprilTag detection (and its grayscale downsampling) is enabled. */
+    private var aprilTagDetectionEnabled = false
 
     private val aprilTagRunnable = object : Runnable {
         override fun run() {
@@ -548,7 +557,17 @@ class DualCameraActivity : AppCompatActivity() {
         surfaceCamera.holder.addCallback(surfaceCallback)
 
         applyPreviewRotation()
-        startLiveAprilTagDetection()
+
+        // Live AprilTag detection is part of the optional video-processing pipeline.
+        // It defaults to off and can be toggled from Settings.
+        aprilTagDetectionEnabled = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            .getBoolean(PREF_APRILTAG_ENABLED, false)
+        if (aprilTagDetectionEnabled) {
+            startLiveAprilTagDetection()
+        } else {
+            aprilTagOverlay.detections = emptyList()
+            Log.d(TAG, "Live AprilTag detection disabled by default")
+        }
 
         // Tap anywhere on the preview to capture a still image (debounced)
         surfaceCamera.setOnTouchListener { _, event ->
@@ -2161,12 +2180,17 @@ class DualCameraActivity : AppCompatActivity() {
     private fun showSettingsMenu() {
         PopupMenu(this, settingsButton).apply {
             menuInflater.inflate(R.menu.menu_settings, menu)
+            menu.findItem(R.id.action_enable_apriltag)?.isChecked = aprilTagDetectionEnabled
             menu.findItem(R.id.action_diagnostics)?.title =
                 if (diagnosticsVisible) "Hide diagnostics" else "Show diagnostics"
             menu.findItem(R.id.action_anti_banding)?.title =
                 if (antiBandingTool?.isRunning == true) "Stop anti-banding" else "Anti-banding analysis"
             setOnMenuItemClickListener { item ->
                 when (item.itemId) {
+                    R.id.action_enable_apriltag -> {
+                        setAprilTagDetectionEnabled(!aprilTagDetectionEnabled, source = "settings")
+                        true
+                    }
                     R.id.action_update_firmware -> {
                         Log.d(TAG, "Settings: update firmware selected")
                         promptForFirmwareUrl()
@@ -3077,8 +3101,29 @@ class DualCameraActivity : AppCompatActivity() {
      * Start the background thread that runs AprilTag detection on the live
      * preview bitmap and updates [aprilTagOverlay].
      */
+    /**
+     * Enable or disable live AprilTag detection and persist the choice.
+     * When disabled the detection thread is stopped and the overlay cleared,
+     * which also stops the grayscale Y-plane downsampling compute.
+     */
+    private fun setAprilTagDetectionEnabled(enabled: Boolean, source: String = "intent") {
+        if (aprilTagDetectionEnabled == enabled) return
+        aprilTagDetectionEnabled = enabled
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            .edit()
+            .putBoolean(PREF_APRILTAG_ENABLED, enabled)
+            .apply()
+        if (enabled) {
+            startLiveAprilTagDetection()
+        } else {
+            stopLiveAprilTagDetection()
+            aprilTagOverlay.detections = emptyList()
+        }
+        Log.d(TAG, "AprilTag detection ${if (enabled) "enabled" else "disabled"} (source=$source)")
+    }
+
     private fun startLiveAprilTagDetection() {
-        if (aprilTagThread != null) return
+        if (!aprilTagDetectionEnabled || aprilTagThread != null) return
         val thread = android.os.HandlerThread("AprilTagLive").apply { start() }
         aprilTagThread = thread
         aprilTagHandler = Handler(thread.looper)
@@ -3603,6 +3648,10 @@ class DualCameraActivity : AppCompatActivity() {
         }
         sb.appendLine()
 
+        sb.appendLine("VIDEO PROCESSING PIPELINE")
+        sb.appendLine("  AprilTag detection: ${if (aprilTagDetectionEnabled) "enabled" else "disabled"}")
+        sb.appendLine()
+
         sb.appendLine("CDC STATUS")
         sb.appendLine("  Control IF: ${if (cdcControlInterface != null) "yes" else "no"}")
         sb.appendLine("  Data IF:    ${if (cdcDataInterface != null) "yes" else "no"}")
@@ -3762,6 +3811,12 @@ class DualCameraActivity : AppCompatActivity() {
             diagnosticsPanel.visibility = if (diagnosticsVisible) View.VISIBLE else View.GONE
             if (diagnosticsVisible) updateDiagnostics()
             Log.d(TAG, "EXTRA_DIAGNOSTICS=$diagnosticsVisible")
+        }
+
+        if (intent.hasExtra(EXTRA_APRILTAG_ENABLED)) {
+            val enabled = intent.getBooleanExtra(EXTRA_APRILTAG_ENABLED, false)
+            Log.d(TAG, "EXTRA_APRILTAG_ENABLED=$enabled requested")
+            setAprilTagDetectionEnabled(enabled, source = "intent")
         }
 
         if (intent.getBooleanExtra(EXTRA_RECORD_START, false)) {

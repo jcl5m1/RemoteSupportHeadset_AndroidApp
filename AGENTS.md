@@ -16,8 +16,8 @@ Key user-facing behavior:
 - Labels, sliders, and the settings button auto-hide after 5 seconds.
 - Displays live MIC and SPK level meters at the bottom.
 - Provides a single **Record** button that toggles video recording on/off.
-- Provides a **Settings** popup with **Update firmware** (download from a URL and reflash ESP32-P4) and **Show diagnostics** options.
-- Runs AprilTag detection on the live preview, overlays detected tags, and can compute a colour-correction matrix from a Macbeth chart.
+- Provides a **Settings** popup with **Update firmware** (download from a URL and reflash ESP32-P4), **Show diagnostics**, and **AprilTag detection** options.
+- Runs AprilTag detection on the live preview only when enabled in Settings; it defaults to off. When enabled, detected tags are overlaid and a colour-correction matrix can be computed from a Macbeth chart.
 - Saves debug preview frames when a complete Macbeth chart is detected.
 
 ## Technology stack
