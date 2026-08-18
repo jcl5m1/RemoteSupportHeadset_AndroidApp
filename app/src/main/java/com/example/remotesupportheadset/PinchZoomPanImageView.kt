@@ -198,18 +198,31 @@ class PinchZoomPanImageView @JvmOverloads constructor(
             val focusY = detector.focusY
             val scaleFactor = detector.scaleFactor
 
-            val fitDx = (width - bitmapWidth * baseScale()) / 2f
-            val fitDy = (height - bitmapHeight * baseScale()) / 2f
-
-            // First translate by the focus-point movement so panning works
-            // while the user is pinching.
+            // Pan the image by the focus-point movement so the content under
+            // the user's fingers follows their fingers.
             currentTransX += focusX - lastFocusX
             currentTransY += focusY - lastFocusY
 
-            // Then scale around the current focus point.
-            currentTransX = focusX + scaleFactor * (fitDx + currentTransX - focusX) - fitDx
-            currentTransY = focusY + scaleFactor * (fitDy + currentTransY - focusY) - fitDy
+            // Compute the fit-center translation before and after applying the
+            // new scale, then scale around the current focus point. The bitmap
+            // pixel that is currently under (focusX, focusY) must remain under
+            // that point after scaling.
+            val oldTotalScale = currentTotalScale()
+            val oldFitDx = (width - bitmapWidth * oldTotalScale) / 2f
+            val oldFitDy = (height - bitmapHeight * oldTotalScale) / 2f
+
             currentScale *= scaleFactor
+
+            val newTotalScale = currentTotalScale()
+            val newFitDx = (width - bitmapWidth * newTotalScale) / 2f
+            val newFitDy = (height - bitmapHeight * newTotalScale) / 2f
+
+            // screen = bitmap * totalScale + fit + currentTrans
+            // focus = bitmapUnderFocus * oldTotalScale + oldFit + currentTrans
+            // After scaling, focus must still equal:
+            //   bitmapUnderFocus * newTotalScale + newFit + newCurrentTrans
+            currentTransX = focusX - (focusX - oldFitDx - currentTransX) * scaleFactor - newFitDx
+            currentTransY = focusY - (focusY - oldFitDy - currentTransY) * scaleFactor - newFitDy
 
             lastFocusX = focusX
             lastFocusY = focusY
