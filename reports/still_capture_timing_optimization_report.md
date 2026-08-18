@@ -34,7 +34,10 @@ capture with these phases:
 | `dtSave` | Save file, EXIF metadata, MediaScanner (split into raw/correct/metadata/scan) |
 
 A new helper script, [`scripts/parse_capture_timing.py`](../scripts/parse_capture_timing.py),
-parses these lines and reports means/medians/p95/min/max for each phase.
+parses these lines and reports means/medians/p95/min/max for each phase. It also
+counts CDC OUT retries, capture attempt failures, incomplete JPEG events, USB
+host recovery/health failures, and no-camera events so a single command surfaces
+both timing and stability health.
 
 ## Baseline breakdown
 
@@ -205,6 +208,78 @@ when the buffer is empty, the wait is now ~50 ms instead of ~200 ms.
 - Per-phase timing CSV: [`timing_drain.csv`](timing_drain.csv)
 - Full logcat (local): `/tmp/simcap_drain/full_logcat.log`
 
+## 100-event validation
+
+To confirm the optimizations hold at scale, a 100-event run was executed with
+`--count 100 --wait-min 3 --wait-max 5`.
+
+| Metric | 30-event drain run | 100-event drain run |
+|--------|-------------------|---------------------|
+| Events | 30 | **100** |
+| Completed | 30 / 30 | **100 / 100** |
+| Resumed | 30 / 30 | **100 / 100** |
+| Successes | 30 / 30 | **100 / 100** |
+| Mean tap→complete | 1250 ms | **1155 ms** |
+| Median tap→complete | 1263 ms | **1258 ms** |
+| p95 tap→complete | 1285 ms | **1274 ms** |
+| p99 tap→complete | 1291 ms | **1281 ms** |
+| CDC OUT retries | 2 | **6** |
+| Capture attempt failures | 0 | **0** |
+| USB host recovery | 0 | **0** |
+
+The mean is lower in the 100-event run because a higher proportion of captures
+hit the fast `dtCmdToLen` path.
+
+### 100-event per-phase breakdown
+
+| Phase | Mean | % of total |
+|-------|------|------------|
+| Total | 1153 ms | 100 % |
+| `dtCmdToLen` | 995 ms | 86 % |
+| `dtDrain` | 54 ms | 5 % |
+| `dtPayload` | 73 ms | 6 % |
+| `dtSave` | 20 ms | 2 % |
+| other | <2 ms each | <1 % |
+
+### Histograms
+
+#### Tap to Capture Complete — 100-event drain run
+
+![Tap to Capture Complete](tap_to_complete_100_drain.png)
+
+#### Tap to Live Stream Resume — 100-event drain run
+
+![Tap to Live Stream Resume](tap_to_resume_100_drain.png)
+
+### Raw data
+
+- Events CSV: [`events_100_drain.csv`](events_100_drain.csv)
+- Per-phase timing CSV: [`timing_100_drain.csv`](timing_100_drain.csv)
+- Full logcat (local): `/tmp/simcap_100_drain2/full_logcat.log`
+
+## `dtCmdToLen` bimodality (firmware-side)
+
+With the Android-side costs removed, the timing logs reveal that `dtCmdToLen`
+(command sent → `STILL_LEN` received) is bimodal:
+
+| Mode | Count | Mean `dtCmdToLen` | `dtPendingToLen` |
+|------|-------|-------------------|------------------|
+| Fast | ~25 % | ~770 ms | ~760 ms |
+| Slow | ~75 % | ~1110 ms | ~1100 ms |
+
+The JPEG size is the same in both modes (~188 KB), so the difference is not
+payload size. The firmware appears to have two distinct still-capture latencies:
+a ~760 ms path and a ~1100 ms path. Captures that follow a quickly-resumed
+preview stream are more likely to take the fast path, suggesting the sensor/ISP
+state at the moment the command is issued matters.
+
+This is entirely in the ESP32-P4 firmware and is the largest remaining
+opportunity. Possible firmware-side levers:
+
+- Keep the DVP full-res controller / sensor state warm between captures.
+- Reduce the UVC-stream pause overhead before starting the still capture.
+- Pipeline JPEG encoding so `STILL_LEN` can be returned earlier.
+
 ## USB stall inspection
 
 The original report raised outliers that correlated with USB stack stalls
@@ -218,11 +293,12 @@ port reset. The unplug/replug-class stalls appear to be eliminated.
 ## Conclusion
 
 Two Android-side optimizations cut the mean capture time from ~1.93 s to
-**1.25 s** and p95 from ~1.98 s to **1.29 s**:
+**1.16 s** and p95 from ~1.98 s to **1.27 s**, validated over 100 consecutive
+captures with 100/100 success and zero USB host recovery:
 
 1. Gating `correctFullResJpeg()` on live Macbeth chart detection saved ~550 ms.
 2. Reducing the CDC drain timeout from 200 ms to 50 ms saved another ~150 ms.
 
-The remaining ~1.1 s is dominated by `dtCmdToLen` on the ESP32-P4 firmware.
+The remaining ~1.0 s is dominated by `dtCmdToLen` on the ESP32-P4 firmware.
 That is now the only large reduction left, and it requires work in the
 firmware repo.
