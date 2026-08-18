@@ -235,6 +235,9 @@ class DualCameraActivity : AppCompatActivity() {
     // Runtime CDC command helper (used by analysis tools and still-capture helpers).
     private val cdcCommandHelper by lazy { CdcCommandHelper(this) }
 
+    // Anti-banding servo; created on demand from the settings menu.
+    private var antiBandingTool: AntiBandingTool? = null
+
     // Valid AprilTag IDs for the corner markers of the Macbeth chart layouts
     // (DICT_APRILTAG_16H5, chart sizes 3x3 through 4x6).
     private val MACBETH_CORNER_IDS = setOf(
@@ -2101,6 +2104,8 @@ class DualCameraActivity : AppCompatActivity() {
             menuInflater.inflate(R.menu.menu_settings, menu)
             menu.findItem(R.id.action_diagnostics)?.title =
                 if (diagnosticsVisible) "Hide diagnostics" else "Show diagnostics"
+            menu.findItem(R.id.action_anti_banding)?.title =
+                if (antiBandingTool?.isRunning == true) "Stop anti-banding" else "Anti-banding analysis"
             setOnMenuItemClickListener { item ->
                 when (item.itemId) {
                     R.id.action_update_firmware -> {
@@ -2120,11 +2125,64 @@ class DualCameraActivity : AppCompatActivity() {
                         if (diagnosticsVisible) updateDiagnostics()
                         true
                     }
+                    R.id.action_anti_banding -> {
+                        Log.d(TAG, "Settings: anti-banding selected")
+                        startOrStopAntiBandingAnalysis()
+                        true
+                    }
                     else -> false
                 }
             }
             show()
         }
+    }
+
+    /**
+     * Start or stop the anti-banding exposure servo. The servo uses the latest
+     * NV21 preview frame (converted to Bitmap) to measure banding while sweeping
+     * CSI exposure over CDC-ACM.
+     */
+    private fun startOrStopAntiBandingAnalysis() {
+        val existing = antiBandingTool
+        if (existing?.isRunning == true) {
+            existing.stop()
+            return
+        }
+
+        val tool = AntiBandingTool(
+            activity = this,
+            cdcCommandHelper = cdcCommandHelper,
+            frameProvider = { grabLatestPreviewBitmap() }
+        ).also { antiBandingTool = it }
+
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Anti-banding analysis")
+            .setMessage("Starting...")
+            .setCancelable(false)
+            .setNegativeButton("Stop") { _, _ ->
+                tool.stop()
+            }
+            .show()
+
+        tool.onLog = { message ->
+            dialog.setMessage(message)
+        }
+        tool.onResult = { result ->
+            runOnUiThread {
+                dialog.setMessage(
+                    "Done.\nFlicker: ${result.flickerHz} Hz\n" +
+                            "ESP32 exposure: ${result.esp32Us.toInt()} us\n" +
+                            "Android servo: ${result.androidUs} us\n" +
+                            "Metric: %.4f".format(result.androidMetric) + "\n" +
+                            "Mean intensity: %.1f".format(result.androidMean)
+                )
+                dialog.setButton(AlertDialog.BUTTON_NEGATIVE, "Close") { _, _ ->
+                    tool.stop()
+                    dialog.dismiss()
+                }
+            }
+        }
+        tool.start()
     }
 
     private fun getVideoOutputFile(segmentIndex: Int): File {
@@ -2535,10 +2593,9 @@ class DualCameraActivity : AppCompatActivity() {
             exif.setAttribute(ExifInterface.TAG_DATETIME, dateTime)
             exif.setAttribute(ExifInterface.TAG_DATETIME_ORIGINAL, dateTime)
             exif.setAttribute(ExifInterface.TAG_DATETIME_DIGITIZED, dateTime)
-            // correctFullResJpeg() rotates the still image 90° counter-clockwise
-            // and applies AWB from the Macbeth chart, so EXIF orientation is normal.
-            // When no Macbeth chart is present the correction step is skipped and
-            // the file is left in the sensor's native orientation.
+            // processFullResJpeg() rotates the still image 90° counter-clockwise
+            // to portrait and applies AWB from the Macbeth chart when a chart was
+            // seen recently, so EXIF orientation is normal.
             exif.setAttribute(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL.toString())
 
             getCurrentLocation()?.let { loc ->
@@ -2575,16 +2632,11 @@ class DualCameraActivity : AppCompatActivity() {
         val tAfterRaw = SystemClock.elapsedRealtime()
         timings["saveRaw"] = tAfterRaw - t0
 
-        // Rotate the full-resolution still to upright and apply AWB/colour
-        // correction derived from the Macbeth chart. This is expensive, so only do
-        // it when the live preview has recently seen a stable Macbeth chart.
+        // The full-resolution JPEG from the camera is landscape. Rotate it 90°
+        // counter-clockwise to portrait and, if the live preview recently saw a
+        // stable Macbeth chart, apply AWB / colour correction.
         val macbethSeenRecently = SystemClock.elapsedRealtime() - lastMacbethFrameTime < MACBETH_CHART_RECENCY_MS
-        if (macbethSeenRecently) {
-            correctFullResJpeg(file, timings)
-        } else {
-            Log.d(TAG, "Skipping full-res correction for ${file.name}: no Macbeth chart seen in last ${MACBETH_CHART_RECENCY_MS}ms")
-            timings["correct"] = 0
-        }
+        processFullResJpeg(file, applyAwb = macbethSeenRecently, timings)
         val tAfterCorrect = SystemClock.elapsedRealtime()
         if (!timings.containsKey("correct")) {
             timings["correct"] = tAfterCorrect - tAfterRaw
@@ -2605,13 +2657,18 @@ class DualCameraActivity : AppCompatActivity() {
 
     /**
      * Decode the freshly saved full-resolution JPEG, rotate it 90°
-     * counter-clockwise, and apply AWB / colour correction derived from the
-     * Macbeth chart when all four 4x6 corner tags are detected. The file is
-     * overwritten with the processed image. Large images (>24 MP) are skipped to
-     * avoid OOM.
+     * counter-clockwise to portrait, and apply AWB / colour correction derived
+     * from the Macbeth chart when [applyAwb] is true and all four 4x6 corner
+     * tags are detected. The file is overwritten with the processed image.
+     * Large images (>24 MP) are skipped to avoid OOM.
+     *
+     * @param file The JPEG file to process.
+     * @param applyAwb Whether to attempt Macbeth AWB correction.
+     * @param timings Mutable timing map; receives "correctFullRes".
      */
-    private fun correctFullResJpeg(file: File, timings: MutableMap<String, Long> = mutableMapOf()) {
+    private fun processFullResJpeg(file: File, applyAwb: Boolean, timings: MutableMap<String, Long>) {
         val t0 = SystemClock.elapsedRealtime()
+        var awbApplied = false
         try {
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeFile(file.absolutePath, bounds)
@@ -2637,31 +2694,34 @@ class DualCameraActivity : AppCompatActivity() {
                     return
                 }
 
+            // Rotate the landscape sensor image to portrait. AWB / colour correction
+            // is applied to the rotated image when a Macbeth chart was seen recently.
             val rotated = rotateBitmap90Ccw(original)
             original.recycle()
 
-            // Detect the 4x6 Macbeth chart in the upright rotated image and apply
-            // a diagonal AWB correction from its white/grey patch.
-            var awbApplied = false
-            val processed = try {
-                val detections = detectMacbeth4x6(rotated)
-                val gains = if (detections.size >= 4) {
-                    MacbethColorCorrector.estimateAwbGains(rotated, detections)
-                } else null
-                if (gains != null && gains.all { it in 0.2f..5f }) {
-                    val corrected = MacbethColorCorrector.applyAwb(rotated, gains)
-                    rotated.recycle()
-                    awbApplied = true
-                    Log.i(TAG, "Applied AWB to ${file.name}: gains=${gains.contentToString()}")
-                    corrected
-                } else {
-                    if (gains != null) {
-                        Log.w(TAG, "AWB gains out of range for ${file.name}: ${gains.contentToString()}")
+            val processed = if (applyAwb) {
+                try {
+                    val detections = detectMacbeth4x6(rotated)
+                    val gains = if (detections.size >= 4) {
+                        MacbethColorCorrector.estimateAwbGains(rotated, detections)
+                    } else null
+                    if (gains != null && gains.all { it in 0.2f..5f }) {
+                        val corrected = MacbethColorCorrector.applyAwb(rotated, gains)
+                        rotated.recycle()
+                        awbApplied = true
+                        Log.i(TAG, "Applied AWB to ${file.name}: gains=${gains.contentToString()}")
+                        corrected
+                    } else {
+                        if (gains != null) {
+                            Log.w(TAG, "AWB gains out of range for ${file.name}: ${gains.contentToString()}")
+                        }
+                        rotated
                     }
+                } catch (e: Exception) {
+                    Log.w(TAG, "AWB processing failed for ${file.name}", e)
                     rotated
                 }
-            } catch (e: Exception) {
-                Log.w(TAG, "AWB processing failed for ${file.name}", e)
+            } else {
                 rotated
             }
 
@@ -2684,7 +2744,12 @@ class DualCameraActivity : AppCompatActivity() {
         }
         val dt = SystemClock.elapsedRealtime() - t0
         timings["correctFullRes"] = dt
-        Log.d(TAG, "correctFullResJpeg total: ${dt}ms for ${file.name}")
+        Log.d(TAG, "processFullResJpeg total: ${dt}ms for ${file.name}, awbApplied=$awbApplied")
+    }
+
+    private fun rotateBitmap90Ccw(bitmap: Bitmap): Bitmap {
+        val matrix = Matrix().apply { postRotate(-90f) }
+        return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
     }
 
     /**
@@ -2702,11 +2767,6 @@ class DualCameraActivity : AppCompatActivity() {
             if (uniqueIds.size >= 4) return chartDetections
         }
         return emptyList()
-    }
-
-    private fun rotateBitmap90Ccw(bitmap: Bitmap): Bitmap {
-        val matrix = Matrix().apply { postRotate(-90f) }
-        return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
     }
 
     private fun generateThumbnailAsync(file: File) {
@@ -3178,6 +3238,16 @@ class DualCameraActivity : AppCompatActivity() {
         return false
     }
 
+    /**
+     * Grab the latest NV21 preview frame and convert it to an ARGB Bitmap for
+     * analysis tools (e.g. the anti-banding servo). Returns null if no frame has
+     * arrived yet or conversion fails.
+     */
+    private fun grabLatestPreviewBitmap(): Bitmap? {
+        val frame = previewFrameQueue.poll() ?: return null
+        return nv21ToBitmap(frame.data, frame.width, frame.height)
+    }
+
     private fun checkAndRequestPermissions() {
         val permissions = arrayOf(
             Manifest.permission.CAMERA,
@@ -3611,6 +3681,8 @@ class DualCameraActivity : AppCompatActivity() {
         super.onDestroy()
         stopLifecycleTest()
         stopLiveAprilTagDetection()
+        antiBandingTool?.stop()
+        antiBandingTool = null
         isZoomOpen = false
         thumbnailUpdateHandler.removeCallbacks(thumbnailUpdateRunnable)
         cameraClient?.unRegister()

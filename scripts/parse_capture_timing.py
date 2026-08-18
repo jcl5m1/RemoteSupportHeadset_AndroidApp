@@ -38,7 +38,7 @@ COMPLETE_RE = re.compile(
 )
 
 SKIP_RE = re.compile(r"Skipping full-res correction for .* no Macbeth chart seen")
-CORRECT_RE = re.compile(r"correctFullResJpeg total: (\d+)ms for (.*)")
+CORRECT_RE = re.compile(r"(?:correctFullResJpeg|processFullResJpeg) total: (\d+)ms for (.*)")
 
 # Stall / recovery / failure signatures.
 CDC_OUT_RETRY_RE = re.compile(r"CDC OUT bulkTransfer failed \(attempt (\d+)/(\d+)\)")

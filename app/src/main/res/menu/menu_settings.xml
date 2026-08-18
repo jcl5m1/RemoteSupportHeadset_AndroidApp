@@ -9,4 +9,7 @@
     <item
         android:id="@+id/action_check_latest_firmware"
         android:title="Check for latest firmware" />
+    <item
+        android:id="@+id/action_anti_banding"
+        android:title="Anti-banding analysis" />
 </menu>

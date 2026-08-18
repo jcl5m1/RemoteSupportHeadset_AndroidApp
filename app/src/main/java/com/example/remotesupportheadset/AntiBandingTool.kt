@@ -3,7 +3,6 @@ package com.example.remotesupportheadset
 import android.app.Activity
 import android.graphics.Bitmap
 import android.util.Log
-import com.jiangdg.ausbc.widget.AspectRatioTextureView
 import java.util.concurrent.CountDownLatch
 
 /**
@@ -11,14 +10,15 @@ import java.util.concurrent.CountDownLatch
  * finds the value that minimizes horizontal rolling-shutter banding on a
  * uniform surface (e.g. a white wall).
  *
- * This is intentionally **not** wired into the normal DualCameraActivity UI.
- * It is kept as a callable analysis utility for experiments; call [start]
- * from a debug/test path when needed.
+ * The tool no longer depends on a TextureView; it accepts a frame provider
+ * that returns the current preview Bitmap (e.g. from an NV21→Bitmap conversion
+ * of the latest camera callback frame). It can be started from a debug/test
+ * path or from a settings menu item.
  */
 class AntiBandingTool(
     private val activity: Activity,
-    private val textureCamera: AspectRatioTextureView,
-    private val cdcCommandHelper: CdcCommandHelper
+    private val cdcCommandHelper: CdcCommandHelper,
+    private val frameProvider: () -> Bitmap?
 ) {
 
     data class Result(
@@ -238,15 +238,18 @@ class AntiBandingTool(
     private fun captureBitmapForAnalysis(): Bitmap? {
         val latch = CountDownLatch(1)
         var bmp: Bitmap? = null
+        var error: Exception? = null
         activity.runOnUiThread {
             try {
-                bmp = textureCamera.bitmap
+                bmp = frameProvider()
             } catch (e: Exception) {
+                error = e
                 Log.w(TAG, "Failed to grab preview bitmap", e)
             }
             latch.countDown()
         }
         latch.await()
+        if (error != null) throw error!!
         return bmp
     }
 
