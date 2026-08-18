@@ -5,7 +5,6 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Matrix
 import android.graphics.Paint
-import android.graphics.RectF
 import android.util.AttributeSet
 import android.view.GestureDetector
 import android.view.MotionEvent
@@ -38,6 +37,10 @@ class PinchZoomPanImageView @JvmOverloads constructor(
     private var lastTouchY = 0f
     private var activePointerId = MotionEvent.INVALID_POINTER_ID
     private var isDragging = false
+
+    // Pinch gesture focus tracking so panning works while zooming.
+    private var lastFocusX = 0f
+    private var lastFocusY = 0f
 
     // Current transform relative to the base fit-center transform.
     private var currentScale = 1f
@@ -184,26 +187,32 @@ class PinchZoomPanImageView @JvmOverloads constructor(
     }
 
     private inner class ScaleListener : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+        override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
+            lastFocusX = detector.focusX
+            lastFocusY = detector.focusY
+            return true
+        }
+
         override fun onScale(detector: ScaleGestureDetector): Boolean {
-            val scaleFactor = detector.scaleFactor
             val focusX = detector.focusX
             val focusY = detector.focusY
+            val scaleFactor = detector.scaleFactor
 
-            // Convert focus point from view coords to bitmap-local coords so
-            // scaling keeps the point under the fingers stable.
-            val totalScaleBefore = currentTotalScale()
-            val focusBitmapX = (focusX - (width - bitmapWidth * totalScaleBefore) / 2f - currentTransX) / totalScaleBefore
-            val focusBitmapY = (focusY - (height - bitmapHeight * totalScaleBefore) / 2f - currentTransY) / totalScaleBefore
+            val fitDx = (width - bitmapWidth * baseScale()) / 2f
+            val fitDy = (height - bitmapHeight * baseScale()) / 2f
 
+            // First translate by the focus-point movement so panning works
+            // while the user is pinching.
+            currentTransX += focusX - lastFocusX
+            currentTransY += focusY - lastFocusY
+
+            // Then scale around the current focus point.
+            currentTransX = focusX + scaleFactor * (fitDx + currentTransX - focusX) - fitDx
+            currentTransY = focusY + scaleFactor * (fitDy + currentTransY - focusY) - fitDy
             currentScale *= scaleFactor
-            constrainTransform()
 
-            // Adjust translation so the same bitmap point stays under focus.
-            val totalScaleAfter = currentTotalScale()
-            val newFocusViewX = (width - bitmapWidth * totalScaleAfter) / 2f + currentTransX + focusBitmapX * totalScaleAfter
-            val newFocusViewY = (height - bitmapHeight * totalScaleAfter) / 2f + currentTransY + focusBitmapY * totalScaleAfter
-            currentTransX += focusX - newFocusViewX
-            currentTransY += focusY - newFocusViewY
+            lastFocusX = focusX
+            lastFocusY = focusY
 
             constrainTransform()
             updateMatrix()
