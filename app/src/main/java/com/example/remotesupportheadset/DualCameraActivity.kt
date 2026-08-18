@@ -282,7 +282,15 @@ class DualCameraActivity : AppCompatActivity() {
     private var firmwareBuildVersion: String? = null
     private val firmwareVersionRunnable = object : Runnable {
         override fun run() {
-            queryFirmwareBuildVersion()
+            // The version query opens a separate CDC-ACM connection via
+            // usb-serial-for-android.  Concurrent CDC traffic while a still
+            // capture is running has been observed to stall the capture's own
+            // CDC OUT bulkTransfer, so skip the query until the capture ends.
+            if (!isCapturing) {
+                queryFirmwareBuildVersion()
+            } else {
+                Log.v(TAG, "Firmware version query skipped: capture in progress")
+            }
             mainHandler.postDelayed(this, FIRMWARE_VERSION_INTERVAL_MS)
         }
     }
@@ -736,10 +744,12 @@ class DualCameraActivity : AppCompatActivity() {
     private fun refreshCdcState() {
         val device = currentDevice ?: return
         val ctrlBlock = currentCtrlBlock ?: return
+        val t0 = SystemClock.elapsedRealtime()
         Log.d(TAG, "Refreshing CDC state...")
         releaseCdc()
         setupCdc(device, ctrlBlock)
-        Log.d(TAG, "CDC refresh: control=${cdcControlInterface != null}, data=${cdcDataInterface != null}, out=${cdcOutEndpoint != null}, in=${cdcInEndpoint != null}")
+        val dt = SystemClock.elapsedRealtime() - t0
+        Log.d(TAG, "CDC refresh done in ${dt}ms: control=${cdcControlInterface != null}, data=${cdcDataInterface != null}, out=${cdcOutEndpoint != null}, in=${cdcInEndpoint != null}")
         cdcOutEndpoint?.let { clearEndpointHalt(it) }
         cdcInEndpoint?.let { clearEndpointHalt(it) }
     }
@@ -775,10 +785,12 @@ class DualCameraActivity : AppCompatActivity() {
      */
     private fun clearEndpointHalt(endpoint: UsbEndpoint): Int {
         val conn = cdcConnection ?: return -1
+        val t0 = SystemClock.elapsedRealtime()
         // 0x02 = host-to-device | standard | endpoint recipient
         // bRequest = USB_REQ_CLEAR_FEATURE (1), wValue = ENDPOINT_HALT (0)
         val result = conn.controlTransfer(0x02, 1, 0, endpoint.address, null, 0, CDC_TIMEOUT_MS)
-        Log.d(TAG, "Cleared endpoint halt 0x${endpoint.address.toString(16)}: result=$result")
+        val dt = SystemClock.elapsedRealtime() - t0
+        Log.d(TAG, "Cleared endpoint halt 0x${endpoint.address.toString(16)}: result=$result, took=${dt}ms")
         return result
     }
 
@@ -2146,12 +2158,14 @@ class DualCameraActivity : AppCompatActivity() {
 
         var lastException: Exception? = null
         var succeeded = false
+        val captureT0 = SystemClock.elapsedRealtime()
         try {
             for (attempt in 1..maxRetries) {
                 if (cancelCheck()) {
                     Log.d(TAG, "Capture cancelled mid-retry")
                     break
                 }
+                val attemptT0 = SystemClock.elapsedRealtime()
                 try {
                     if (cdcOutEndpoint == null || cdcInEndpoint == null || cdcConnection == null) {
                         Log.w(TAG, "CDC not ready on attempt $attempt; refreshing state")
@@ -2163,10 +2177,13 @@ class DualCameraActivity : AppCompatActivity() {
 
                     doSingleCapture()
                     succeeded = true
+                    val attemptDt = SystemClock.elapsedRealtime() - attemptT0
+                    Log.d(TAG, "Capture attempt $attempt/$maxRetries succeeded in ${attemptDt}ms")
                     return true
                 } catch (e: Exception) {
                     lastException = e
-                    Log.w(TAG, "Capture attempt $attempt/$maxRetries failed: ${e.message}", e)
+                    val attemptDt = SystemClock.elapsedRealtime() - attemptT0
+                    Log.w(TAG, "Capture attempt $attempt/$maxRetries failed after ${attemptDt}ms: ${e.message}", e)
                     if (attempt < maxRetries) {
                         refreshCdcState()
                         Thread.sleep(500)
@@ -2203,24 +2220,45 @@ class DualCameraActivity : AppCompatActivity() {
         val conn = cdcConnection ?: throw RuntimeException("CDC connection lost")
         val outEp = cdcOutEndpoint ?: throw RuntimeException("CDC OUT endpoint lost")
         val inEp = cdcInEndpoint ?: throw RuntimeException("CDC IN endpoint lost")
+        val captureT0 = SystemClock.elapsedRealtime()
 
-        Log.d(TAG, "doSingleCapture: conn=${System.identityHashCode(conn)}, " +
+        Log.d(TAG, "doSingleCapture start: conn=${System.identityHashCode(conn)}, " +
                 "outEp=0x${outEp.address.toString(16)} (max=${outEp.maxPacketSize}), " +
                 "inEp=0x${inEp.address.toString(16)} (max=${inEp.maxPacketSize}), " +
-                "device=${currentDevice?.deviceName}, ctrlBlock=${currentCtrlBlock != null}")
+                "device=${currentDevice?.deviceName}, ctrlBlock=${currentCtrlBlock != null}, " +
+                "lastFrame=${SystemClock.elapsedRealtime() - lastFrameTime}ms ago")
 
         // Drain stale input
         drainStaleInput(conn, inEp)
+        val tAfterDrain = SystemClock.elapsedRealtime()
 
-        // Send capture command
+        // Send capture command.  Retry a few times on OUT stall; the endpoint can
+        // enter a transient halt state under load, and re-sending immediately after
+        // clearing the halt is cheaper than a full capture retry cycle.
         val cmd = "s\r\n".toByteArray(Charsets.UTF_8)
-        val written = conn.bulkTransfer(outEp, cmd, cmd.size, CDC_TIMEOUT_MS)
+        var written = -1
+        var outAttempts = 0
+        val maxOutAttempts = 3
+        while (outAttempts < maxOutAttempts) {
+            written = conn.bulkTransfer(outEp, cmd, cmd.size, CDC_TIMEOUT_MS)
+            if (written >= 0) break
+            outAttempts++
+            Log.w(TAG, "CDC OUT bulkTransfer failed (attempt $outAttempts/$maxOutAttempts): written=$written, " +
+                    "outEp=0x${outEp.address.toString(16)}, lastFrame=${SystemClock.elapsedRealtime() - lastFrameTime}ms ago")
+            if (outAttempts < maxOutAttempts) {
+                clearEndpointHalt(outEp)
+                Thread.sleep(150)
+            }
+        }
+        val tAfterOut = SystemClock.elapsedRealtime()
         if (written < 0) {
-            Log.e(TAG, "CDC OUT bulkTransfer failed: written=$written, outEp=0x${outEp.address.toString(16)}, " +
-                    "conn=${System.identityHashCode(conn)}, ctrlBlock=${currentCtrlBlock != null}, " +
-                    "device=${currentDevice?.deviceName}, lastFrame=${SystemClock.elapsedRealtime() - lastFrameTime}ms ago")
+            Log.e(TAG, "CDC OUT bulkTransfer failed after $maxOutAttempts attempts: written=$written, " +
+                    "outEp=0x${outEp.address.toString(16)}, conn=${System.identityHashCode(conn)}, " +
+                    "ctrlBlock=${currentCtrlBlock != null}, device=${currentDevice?.deviceName}, " +
+                    "lastFrame=${SystemClock.elapsedRealtime() - lastFrameTime}ms ago")
             throw RuntimeException("Failed to send capture command (bulkTransfer returned $written)")
         }
+        Log.d(TAG, "doSingleCapture cmd sent: written=$written, outAttempts=${outAttempts + 1}, dtDrain=${tAfterOut - captureT0}ms")
 
         // Read response (STILL_LEN etc.) with a short deadline so a device reset
         // does not leave us blocked for the full payload timeout.
@@ -2237,6 +2275,8 @@ class DualCameraActivity : AppCompatActivity() {
                 line.startsWith("STILL_LEN ") -> {
                     stillLen = line.substring("STILL_LEN ".length).trim().toIntOrNull()
                         ?: throw RuntimeException("Invalid STILL_LEN")
+                    val tAfterLen = SystemClock.elapsedRealtime()
+                    Log.d(TAG, "doSingleCapture STILL_LEN=$stillLen, dtCmdToLen=${tAfterLen - tAfterOut}ms")
                     break
                 }
                 line.startsWith("STILL_FAIL") -> {
@@ -2263,12 +2303,14 @@ class DualCameraActivity : AppCompatActivity() {
         // Read the JPEG payload with the full capture timeout.
         val payloadDeadline = System.currentTimeMillis() + CAPTURE_TIMEOUT_MS
         val jpegData = readExactly(conn, inEp, stillLen, buffer, payloadDeadline)
+        val tAfterPayload = SystemClock.elapsedRealtime()
         if (jpegData.size != stillLen) {
             throw RuntimeException("Incomplete JPEG: got ${jpegData.size}/$stillLen")
         }
         if (jpegData.size < 2 || jpegData[0] != 0xFF.toByte() || jpegData[1] != 0xD8.toByte()) {
             throw RuntimeException("Invalid JPEG magic: ${jpegData.take(2).map { "%02X".format(it) }}")
         }
+        Log.d(TAG, "doSingleCapture payload done: size=${jpegData.size}, dtLenToPayload=${tAfterPayload - captureT0}ms")
 
         // Consume the trailing \r\nSTILL_END\r\n marker (skip any empty lines
         // that may have arrived with the final payload chunk).
@@ -2281,9 +2323,12 @@ class DualCameraActivity : AppCompatActivity() {
             }
             break
         }
+        val tAfterTrailer = SystemClock.elapsedRealtime()
 
         // Save to external app pictures directory
         val file = saveJpeg(jpegData)
+        val tAfterSave = SystemClock.elapsedRealtime()
+        Log.d(TAG, "doSingleCapture complete: total=${tAfterSave - captureT0}ms, dtTrailer=${tAfterTrailer - tAfterPayload}ms, dtSave=${tAfterSave - tAfterTrailer}ms")
         runOnUiThread {
             Toast.makeText(this, "Saved: ${file.name}", Toast.LENGTH_SHORT).show()
         }
@@ -2340,6 +2385,9 @@ class DualCameraActivity : AppCompatActivity() {
         }
         var remaining = n - take
         var consecutiveTimeouts = 0
+        var bytesReceived = out.size()
+        var lastProgressBytes = bytesReceived
+        var lastProgressTime = SystemClock.elapsedRealtime()
         while (remaining > 0) {
             if (System.currentTimeMillis() >= deadline) break
             // Use small 4 KiB chunks and a short per-call timeout.  Tiny requests
@@ -2354,13 +2402,20 @@ class DualCameraActivity : AppCompatActivity() {
             val len = conn.bulkTransfer(inEp, chunk, chunk.size, 3000)
             if (len < 0) {
                 consecutiveTimeouts++
-                if (consecutiveTimeouts % 10 == 0) {
-                    Log.d(TAG, "readExactly: polling, remaining=$remaining, consecutiveTimeouts=$consecutiveTimeouts")
+                if (consecutiveTimeouts == 1 || consecutiveTimeouts % 10 == 0) {
+                    val stalledMs = SystemClock.elapsedRealtime() - lastProgressTime
+                    Log.d(TAG, "readExactly: polling, remaining=$remaining, consecutiveTimeouts=$consecutiveTimeouts, stalled=${stalledMs}ms")
                 }
-                if (consecutiveTimeouts > 60) {
-                    Log.w(TAG, "readExactly: too many consecutive timeouts, remaining=$remaining")
-                    break
+                // The IN endpoint can enter a transient halt under load.  Clear it
+                // after a short streak and reset the counter so a single stall does
+                // not abort an otherwise-healthy payload transfer.
+                if (consecutiveTimeouts >= 5) {
+                    Log.d(TAG, "readExactly: clearing IN endpoint halt after $consecutiveTimeouts consecutive timeouts")
+                    clearEndpointHalt(inEp)
+                    consecutiveTimeouts = 0
                 }
+                // Avoid tight-spinning on an immediately-failing endpoint.
+                Thread.sleep(10)
                 continue
             }
             consecutiveTimeouts = 0
@@ -2368,8 +2423,16 @@ class DualCameraActivity : AppCompatActivity() {
                 val usable = minOf(len, remaining)
                 out.write(chunk, 0, usable)
                 remaining -= usable
+                bytesReceived += usable
                 if (len > usable) {
                     buffer.write(chunk, usable, len - usable)
+                }
+                if (bytesReceived - lastProgressBytes >= 51200) {
+                    val now = SystemClock.elapsedRealtime()
+                    val kbps = if (now > lastProgressTime) (bytesReceived - lastProgressBytes) * 1000 / (now - lastProgressTime) / 1024 else 0
+                    Log.d(TAG, "readExactly progress: received=$bytesReceived/$n, kbps=$kbps, elapsed=${now - lastProgressTime}ms")
+                    lastProgressBytes = bytesReceived
+                    lastProgressTime = now
                 }
             }
         }

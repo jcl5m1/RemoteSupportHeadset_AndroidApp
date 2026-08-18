@@ -12,6 +12,7 @@
 #include <android/bitmap.h>
 #include <android/log.h>
 #include <jni.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,6 +31,7 @@ static apriltag_detector_t *s_detector = NULL;
 static apriltag_family_t *s_tag_family = NULL;
 static jclass s_detection_class = NULL;
 static jmethodID s_detection_ctor = NULL;
+static pthread_mutex_t s_detect_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static inline double monotonic_ms(void)
 {
@@ -68,9 +70,14 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved)
     }
 
     // Tune for reasonable speed/accuracy on Android still images.
+    // nthreads is intentionally 1: the AprilTag3 worker-pool has shown rare
+    // zarray races (assertion "idx < za->size" in worker_thread) when the
+    // detector is shared across the live preview and Macbeth-chart paths.
+    // A single thread plus a process-wide mutex keeps detection stable at the
+    // cost of ~2x CPU time, which is still well within the preview frame budget.
     s_detector->quad_decimate = 2.0f;
     s_detector->quad_sigma = 0.0f;
-    s_detector->nthreads = 2;
+    s_detector->nthreads = 1;
     s_detector->refine_edges = 1;
     s_detector->decode_sharpening = 0.25;
 
@@ -170,7 +177,10 @@ Java_com_example_remotesupportheadset_AprilTagDetector_nativeDetect(
 
     const double t_convert = monotonic_ms();
 
+    pthread_mutex_lock(&s_detect_mutex);
     zarray_t *detections = apriltag_detector_detect(s_detector, im);
+    pthread_mutex_unlock(&s_detect_mutex);
+
     const double t_detect = monotonic_ms();
     image_u8_destroy(im);
 
@@ -255,7 +265,10 @@ Java_com_example_remotesupportheadset_AprilTagDetector_nativeDetectGray(
 
     const double t_convert = monotonic_ms();
 
+    pthread_mutex_lock(&s_detect_mutex);
     zarray_t *detections = apriltag_detector_detect(s_detector, im);
+    pthread_mutex_unlock(&s_detect_mutex);
+
     const double t_detect = monotonic_ms();
     image_u8_destroy(im);
 
