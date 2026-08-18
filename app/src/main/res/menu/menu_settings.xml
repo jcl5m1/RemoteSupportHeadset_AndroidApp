@@ -1,12 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <menu xmlns:android="http://schemas.android.com/apk/res/android">
     <item
+        android:id="@+id/action_diagnostics"
+        android:title="Show diagnostics"
+        android:checkable="true" />
+    <item
         android:id="@+id/action_enable_apriltag"
         android:title="AprilTag detection"
         android:checkable="true" />
-    <item
-        android:id="@+id/action_diagnostics"
-        android:title="Show diagnostics" />
     <item
         android:id="@+id/action_update_firmware"
         android:title="Update firmware" />

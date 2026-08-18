@@ -2186,9 +2186,8 @@ class DualCameraActivity : AppCompatActivity() {
     private fun showSettingsMenu() {
         PopupMenu(this, settingsButton).apply {
             menuInflater.inflate(R.menu.menu_settings, menu)
+            menu.findItem(R.id.action_diagnostics)?.isChecked = diagnosticsVisible
             menu.findItem(R.id.action_enable_apriltag)?.isChecked = aprilTagDetectionEnabled
-            menu.findItem(R.id.action_diagnostics)?.title =
-                if (diagnosticsVisible) "Hide diagnostics" else "Show diagnostics"
             menu.findItem(R.id.action_anti_banding)?.title =
                 if (antiBandingTool?.isRunning == true) "Stop anti-banding" else "Anti-banding analysis"
             setOnMenuItemClickListener { item ->
