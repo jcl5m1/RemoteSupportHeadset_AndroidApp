@@ -71,12 +71,12 @@ class AprilTagOverlayView @JvmOverloads constructor(
     }
 
     private val yoloBoxFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(180, 80, 80, 80)
+        color = Color.YELLOW
         style = Paint.Style.FILL
     }
 
     private val yoloTextFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.YELLOW
+        color = Color.DKGRAY
         textSize = 32f
         style = Paint.Style.FILL
     }

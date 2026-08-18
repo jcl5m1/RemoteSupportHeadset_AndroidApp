@@ -639,6 +639,8 @@ class DualCameraActivity : AppCompatActivity() {
             statusCamera.visibility = View.GONE
             labelCamera.text = "Video test source"
             tapHint.visibility = View.GONE
+            diagnosticsVisible = false
+            diagnosticsPanel.visibility = View.GONE
         }
 
         // Live AprilTag detection is part of the optional video-processing pipeline.
@@ -2767,6 +2769,8 @@ class DualCameraActivity : AppCompatActivity() {
         statusCamera.visibility = View.GONE
         labelCamera.text = "Video test source"
         tapHint.visibility = View.GONE
+        diagnosticsVisible = false
+        diagnosticsPanel.visibility = View.GONE
         mainHandler.removeCallbacks(hideHintRunnable)
 
         startVideoFrameSource()
@@ -4292,6 +4296,21 @@ class DualCameraActivity : AppCompatActivity() {
         sb.appendLine("=== RemoteSupportHeadset Diagnostics ===")
         sb.appendLine()
 
+        if (videoTestMode) {
+            sb.appendLine("Video test source active")
+            sb.appendLine("  Path: $videoTestPath")
+            sb.appendLine("  Resolution: ${videoTestFrameWidth}x${videoTestFrameHeight}")
+            sb.appendLine("  Frame rate (measured): $currentFps FPS")
+            sb.appendLine()
+            sb.appendLine("VIDEO PROCESSING PIPELINE")
+            sb.appendLine("  AprilTag detection: ${if (aprilTagDetectionEnabled) "enabled" else "disabled"}")
+            sb.appendLine("  Person detection:   ${if (yoloDetectionEnabled) "enabled" else "disabled"}${
+                if (yoloDetectionEnabled) " (last=${yoloLastInferenceTime}ms, persons=$yoloLastDetectionCount)" else ""
+            }")
+            diagnosticsText.text = sb.toString()
+            return
+        }
+
         val device = currentDevice
         if (device == null) {
             sb.appendLine("No USB camera currently connected.")
@@ -4505,7 +4524,7 @@ class DualCameraActivity : AppCompatActivity() {
             startOrStopAntiBandingAnalysis(forcedHz)
         }
 
-        if (intent.hasExtra(EXTRA_DIAGNOSTICS)) {
+        if (intent.hasExtra(EXTRA_DIAGNOSTICS) && !videoTestMode) {
             diagnosticsVisible = intent.getBooleanExtra(EXTRA_DIAGNOSTICS, false)
             diagnosticsPanel.visibility = if (diagnosticsVisible) View.VISIBLE else View.GONE
             if (diagnosticsVisible) updateDiagnostics()
