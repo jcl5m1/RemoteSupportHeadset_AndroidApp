@@ -107,15 +107,22 @@ class PinchZoomPanImageView @JvmOverloads constructor(
         val scaledWidth = bitmapWidth * totalScale
         val scaledHeight = bitmapHeight * totalScale
 
-        // Center the image if it is smaller than the view; otherwise keep it
-        // within the view bounds.
+        // Center the image if it is smaller than the view; otherwise allow
+        // symmetric panning so every edge of the zoomed image can be brought
+        // into view.
         currentTransX = when {
             scaledWidth <= width.toFloat() -> 0f
-            else -> currentTransX.coerceIn(width - scaledWidth, 0f)
+            else -> currentTransX.coerceIn(
+                -(scaledWidth - width) / 2f,
+                (scaledWidth - width) / 2f
+            )
         }
         currentTransY = when {
             scaledHeight <= height.toFloat() -> 0f
-            else -> currentTransY.coerceIn(height - scaledHeight, 0f)
+            else -> currentTransY.coerceIn(
+                -(scaledHeight - height) / 2f,
+                (scaledHeight - height) / 2f
+            )
         }
     }
 
