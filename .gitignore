@@ -50,3 +50,7 @@ pulled_images/
 yolov8n.pt
 yolov8n.onnx
 yolov8n_*.onnx
+
+# YOLO video test source assets (downloaded clips and extracted frames)
+scripts/test_video_assets/
+**/TestFrames/

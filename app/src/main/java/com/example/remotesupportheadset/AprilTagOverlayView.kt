@@ -65,13 +65,18 @@ class AprilTagOverlayView @JvmOverloads constructor(
     }
 
     private val yoloBoxPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.RED
+        color = Color.YELLOW
         strokeWidth = 5f
         style = Paint.Style.STROKE
     }
 
+    private val yoloBoxFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(180, 80, 80, 80)
+        style = Paint.Style.FILL
+    }
+
     private val yoloTextFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.RED
+        color = Color.YELLOW
         textSize = 32f
         style = Paint.Style.FILL
     }
@@ -111,15 +116,16 @@ class AprilTagOverlayView @JvmOverloads constructor(
 
     private fun drawYoloDetections(canvas: Canvas) {
         for (d in yoloDetections) {
-            val left = d.rect.left * width
-            val top = d.rect.top * height
-            val right = d.rect.right * width
-            val bottom = d.rect.bottom * height
-            canvas.drawRect(left, top, right, bottom, yoloBoxPaint)
+            // [d.rect] is already in this view's coordinate space (same convention
+            // as the AprilTag corners), so draw it directly without re-scaling.
+            // Fill the box with a translucent gray to obscure the detected person,
+            // then draw the yellow outline and label on top.
+            canvas.drawRect(d.rect, yoloBoxFillPaint)
+            canvas.drawRect(d.rect, yoloBoxPaint)
             val label = "${d.label} ${(d.confidence * 100).toInt()}%"
-            val baseline = if (top + yoloTextFillPaint.textSize > yoloTextFillPaint.textSize) top + yoloTextFillPaint.textSize else yoloTextFillPaint.textSize
-            canvas.drawText(label, left + 6f, baseline, yoloTextOutlinePaint)
-            canvas.drawText(label, left + 6f, baseline, yoloTextFillPaint)
+            val baseline = (d.rect.top + yoloTextFillPaint.textSize).coerceAtLeast(yoloTextFillPaint.textSize)
+            canvas.drawText(label, d.rect.left + 6f, baseline, yoloTextOutlinePaint)
+            canvas.drawText(label, d.rect.left + 6f, baseline, yoloTextFillPaint)
         }
     }
 }

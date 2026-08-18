@@ -158,6 +158,32 @@ I AntiBandResult: FLICKER_HZ=50 ESP32_US=19999 ANDROID_US=19800 ANDROID_METRIC=0
 - `ANDROID_METRIC` is the normalized vertical-slice standard deviation at that exposure (lower is better).
 - `ANDROID_MEAN` is the average luminance at the chosen exposure; values near 255 indicate saturation.
 
+### Video test source
+
+For YOLO / AprilTag validation without a physical camera, the app can replay a directory of JPEG frames as a synthetic camera feed.
+
+1. Prepare a clip (default: the `f6Qu3eeRz4c` 25 s clip):
+
+   ```bash
+   python3 scripts/prepare_yolo_test_video.py
+   ```
+
+2. Push the extracted frames to the device:
+
+   ```bash
+   adb shell rm -rf /sdcard/Android/data/com.example.remotesupportheadset/files/TestFrames
+   adb push scripts/test_video_assets/test_frames/ /sdcard/Android/data/com.example.remotesupportheadset/files/TestFrames/
+   ```
+
+3. Launch the app in video-test mode:
+
+   ```bash
+   adb shell am start -S -n com.example.remotesupportheadset/.DualCameraActivity \
+       --es video_test_path /sdcard/Android/data/com.example.remotesupportheadset/files/TestFrames/
+   ```
+
+Or start it from **Settings → Video test source** while the app is running. Enable **Person detection** in Settings (or add `--ez yolo_enabled true`) to validate YOLO overlays. Still capture is disabled in this mode.
+
 ## Notes
 
 - Cameras are assigned left→right in the order they are detected.

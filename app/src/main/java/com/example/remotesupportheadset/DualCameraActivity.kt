@@ -84,6 +84,7 @@ import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantLock
 import java.util.zip.ZipInputStream
+import kotlin.math.min
 
 class DualCameraActivity : AppCompatActivity() {
 
@@ -145,6 +146,8 @@ class DualCameraActivity : AppCompatActivity() {
         const val EXTRA_APRILTAG_ENABLED = "apriltag_enabled"
         /** Intent extra that enables or disables live YOLO person detection (overrides the saved preference). */
         const val EXTRA_YOLO_ENABLED = "yolo_enabled"
+        /** Intent extra that selects a directory of JPEG frames for the video test source. */
+        const val EXTRA_VIDEO_TEST_PATH = "video_test_path"
 
         /** SharedPreferences file used for persistent app settings. */
         private const val PREFS_NAME = "RemoteSupportHeadsetPrefs"
@@ -154,6 +157,10 @@ class DualCameraActivity : AppCompatActivity() {
         private const val PREF_YOLO_ENABLED = "yolo_enabled"
         /** SharedPreferences key for the forced flicker-frequency mode. */
         private const val PREF_FLICKER_MODE = "flicker_mode"
+        /** SharedPreferences key for the video test source frame directory. */
+        private const val PREF_VIDEO_TEST_PATH = "video_test_path"
+        /** Default on-device directory for video test source frames. */
+        private const val DEFAULT_VIDEO_TEST_PATH = "/sdcard/Android/data/com.example.remotesupportheadset/files/TestFrames/"
         /** Flicker mode values. */
         private const val FLICKER_MODE_AUTO = "auto"
         private const val FLICKER_MODE_50HZ = "50"
@@ -261,6 +268,26 @@ class DualCameraActivity : AppCompatActivity() {
     /** Most recent preview frame shared with the YOLO detection thread. */
     private val latestYoloFrameRef = java.util.concurrent.atomic.AtomicReference<PreviewFrame>()
 
+    /** Frame consumer that feeds the detection threads from the video test source. */
+    private val videoFrameConsumer = object : VideoFrameSource.FrameConsumer {
+        override fun onFrame(bitmap: Bitmap, nv21: ByteArray, width: Int, height: Int) {
+            frameCount.incrementAndGet()
+            lastFrameTime = SystemClock.elapsedRealtime()
+            previewFrameWidth = width
+            previewFrameHeight = height
+            videoTestFrameWidth = width
+            videoTestFrameHeight = height
+
+            // Drop the oldest queued frame and queue the latest for AprilTag.
+            previewFrameQueue.poll()?.let { }
+            previewFrameQueue.offer(PreviewFrame(nv21.copyOf(), width, height))
+            // Share the latest frame with the YOLO thread as well.
+            latestYoloFrameRef.set(PreviewFrame(nv21.copyOf(), width, height))
+
+            bitmap.recycle()
+        }
+    }
+
     // 3x3 colour-correction matrix computed from a detected Macbeth chart.
     private var colorCorrectionMatrix: FloatArray? = null
     private var colorCorrectionEnabled = false
@@ -282,6 +309,14 @@ class DualCameraActivity : AppCompatActivity() {
 
     // Anti-banding servo; created on demand from the settings menu.
     private var antiBandingTool: AntiBandingTool? = null
+
+    // Video test source: replaces the live UVC camera with a looping directory
+    // of JPEG frames for YOLO / AprilTag validation without hardware attached.
+    private var videoFrameSource: VideoFrameSource? = null
+    private var videoTestMode = false
+    private var videoTestPath: String = DEFAULT_VIDEO_TEST_PATH
+    private var videoTestFrameWidth = 0
+    private var videoTestFrameHeight = 0
 
     // Valid AprilTag IDs for the corner markers of the Macbeth chart layouts
     // (DICT_APRILTAG_16H5, chart sizes 3x3 through 4x6).
@@ -464,7 +499,7 @@ class DualCameraActivity : AppCompatActivity() {
      */
     private val cameraHealthCheckRunnable = object : Runnable {
         override fun run() {
-            if (isFinishing) return
+            if (isFinishing || videoTestMode) return
             val camera = currentCamera
             val now = SystemClock.elapsedRealtime()
             if (camera != null) {
@@ -539,6 +574,10 @@ class DualCameraActivity : AppCompatActivity() {
     private val surfaceCallback = object : SurfaceHolder.Callback {
         override fun surfaceCreated(holder: SurfaceHolder) {
             Log.d(TAG, "Preview surface created")
+            if (videoTestMode) {
+                startVideoFrameSource()
+                return
+            }
             pendingCameraSetup?.let { setup ->
                 openCameraWithSetup(setup)
                 pendingCameraSetup = null
@@ -551,7 +590,11 @@ class DualCameraActivity : AppCompatActivity() {
 
         override fun surfaceDestroyed(holder: SurfaceHolder) {
             Log.d(TAG, "Preview surface destroyed")
-            currentCamera?.closeCamera()
+            if (videoTestMode) {
+                stopVideoFrameSource()
+            } else {
+                currentCamera?.closeCamera()
+            }
         }
     }
 
@@ -585,6 +628,18 @@ class DualCameraActivity : AppCompatActivity() {
         surfaceCamera.holder.addCallback(surfaceCallback)
 
         applyPreviewRotation()
+
+        // Video test source mode uses a directory of JPEG frames instead of a UVC camera.
+        videoTestPath = intent.getStringExtra(EXTRA_VIDEO_TEST_PATH)
+            ?: getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(PREF_VIDEO_TEST_PATH, DEFAULT_VIDEO_TEST_PATH)
+            ?: DEFAULT_VIDEO_TEST_PATH
+        videoTestMode = intent.hasExtra(EXTRA_VIDEO_TEST_PATH)
+        if (videoTestMode) {
+            Log.d(TAG, "Video test mode enabled, frame dir=$videoTestPath")
+            statusCamera.visibility = View.GONE
+            labelCamera.text = "Video test source"
+            tapHint.visibility = View.GONE
+        }
 
         // Live AprilTag detection is part of the optional video-processing pipeline.
         // It defaults to off and can be toggled from Settings.
@@ -648,9 +703,15 @@ class DualCameraActivity : AppCompatActivity() {
         }
 
         // Show the tap hint briefly, then fade it
-        mainHandler.postDelayed(hideHintRunnable, 8000L)
+        if (!videoTestMode) {
+            mainHandler.postDelayed(hideHintRunnable, 8000L)
+        }
 
-        checkAndRequestPermissions()
+        if (videoTestMode) {
+            Log.d(TAG, "Skipping UVC permission/camera setup for video test mode")
+        } else {
+            checkAndRequestPermissions()
+        }
 
         // Allow an external caller (e.g. adb from a MacBook) to start flashing,
         // capture, zoom, or lifecycle tests via intent extras.  [onNewIntent]
@@ -1016,6 +1077,12 @@ class DualCameraActivity : AppCompatActivity() {
             return
         }
         lastCaptureAttemptTime = now
+
+        if (videoTestMode) {
+            Toast.makeText(this, "Still capture not available in video test mode", Toast.LENGTH_SHORT).show()
+            Log.d(TAG, "Still capture requested in video test mode; ignored")
+            return
+        }
 
         if (lifecycleTestRunning) {
             Toast.makeText(this, "Lifecycle test running; tap Test 20 to stop", Toast.LENGTH_SHORT).show()
@@ -2492,6 +2559,11 @@ class DualCameraActivity : AppCompatActivity() {
                         showAntiBandingDialog()
                         true
                     }
+                    R.id.action_video_test_source -> {
+                        Log.d(TAG, "Settings: video test source selected")
+                        showVideoTestSourceDialog()
+                        true
+                    }
                     else -> false
                 }
             }
@@ -2636,6 +2708,101 @@ class DualCameraActivity : AppCompatActivity() {
             }
             tool.start()
         }.apply { name = "AntiBandingStartupThread"; start() }
+    }
+
+    /**
+     * Show a dialog that lets the user start the video test source using a
+     * directory of JPEG frames on the device. Starting the test source stops any
+     * open UVC camera and switches the preview to the synthetic frame stream.
+     */
+    private fun showVideoTestSourceDialog() {
+        val editText = EditText(this).apply {
+            setText(videoTestPath)
+            hint = "Frame directory path"
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Video test source")
+            .setView(editText)
+            .setPositiveButton("Start") { _, _ ->
+                val path = editText.text.toString().trim()
+                if (path.isEmpty()) {
+                    Toast.makeText(this, "Path cannot be empty", Toast.LENGTH_SHORT).show()
+                    return@setPositiveButton
+                }
+                enterVideoTestMode(path)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    /**
+     * Switch from the live UVC camera to the video test source.
+     */
+    private fun enterVideoTestMode(path: String) {
+        Log.d(TAG, "Entering video test mode: $path")
+
+        // Tear down the UVC camera flow.
+        cameraClient?.unRegister()
+        currentCamera?.closeCamera()
+        currentCamera = null
+        currentDevice = null
+        currentCtrlBlock = null
+        cameraOpenedTime = 0L
+        releaseCdc()
+        pendingPermissionDevices.clear()
+        isRequestingPermission = false
+
+        // Stop UVC-specific periodic runnables.
+        mainHandler.removeCallbacks(devicePollRunnable)
+        mainHandler.removeCallbacks(cameraHealthCheckRunnable)
+        mainHandler.removeCallbacks(firmwareVersionRunnable)
+
+        videoTestMode = true
+        videoTestPath = path
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            .edit()
+            .putString(PREF_VIDEO_TEST_PATH, path)
+            .apply()
+
+        statusCamera.visibility = View.GONE
+        labelCamera.text = "Video test source"
+        tapHint.visibility = View.GONE
+        mainHandler.removeCallbacks(hideHintRunnable)
+
+        startVideoFrameSource()
+    }
+
+    /**
+     * Start [videoFrameSource] if the preview surface is ready and the frame
+     * directory exists.
+     */
+    private fun startVideoFrameSource() {
+        if (videoFrameSource != null) return
+        val dir = File(videoTestPath)
+        if (!dir.isDirectory) {
+            Log.e(TAG, "Video test frame directory does not exist: $videoTestPath")
+            runOnUiThread {
+                Toast.makeText(this, "Test frames not found: $videoTestPath", Toast.LENGTH_LONG).show()
+            }
+            return
+        }
+        videoFrameSource = VideoFrameSource(this, surfaceCamera, dir, videoFrameConsumer).apply {
+            start()
+        }
+        cameraOpenedTime = SystemClock.elapsedRealtime()
+        lastFrameTime = 0L
+        Log.d(TAG, "Video frame source started: $videoTestPath")
+    }
+
+    /**
+     * Stop and release [videoFrameSource].
+     */
+    private fun stopVideoFrameSource() {
+        videoFrameSource?.stop()
+        videoFrameSource?.release()
+        videoFrameSource = null
+        cameraOpenedTime = 0L
+        Log.d(TAG, "Video frame source stopped")
     }
 
     /**
@@ -3594,11 +3761,40 @@ class DualCameraActivity : AppCompatActivity() {
     }
 
     /**
+     * Compute how a [frameW] x [frameH] camera frame is mapped into the overlay
+     * View's coordinate space.
+     *
+     * The SurfaceView and the overlay share the same FrameLayout and are both
+     * gravity-top|center_horizontal. The SurfaceView preserves aspect ratio and is
+     * fit-inside the container, so the active video rectangle is centered
+     * horizontally and flush with the top of the overlay.
+     */
+    private data class OverlayMapping(
+        val renderedW: Float,
+        val renderedH: Float,
+        val offsetX: Float,
+        val offsetY: Float
+    )
+
+    private fun computeOverlayMapping(frameW: Int, frameH: Int): OverlayMapping {
+        val overlayW = aprilTagOverlay.width.toFloat()
+        val overlayH = aprilTagOverlay.height.toFloat()
+        if (overlayW <= 0f || overlayH <= 0f || frameW <= 0 || frameH <= 0) {
+            return OverlayMapping(overlayW, overlayH, 0f, 0f)
+        }
+        val scale = min(overlayW / frameW, overlayH / frameH)
+        val renderedW = frameW * scale
+        val renderedH = frameH * scale
+        val offsetX = (overlayW - renderedW) / 2f
+        return OverlayMapping(renderedW, renderedH, offsetX, 0f)
+    }
+
+    /**
      * Grab the latest NV21 preview frame, convert it to a colour Bitmap, run the
      * YOLOv8n person detector, and update the overlay with the resulting boxes.
      */
     private fun updateLiveYoloOverlay(): Boolean {
-        if (currentCamera == null || isFinishing) return false
+        if ((currentCamera == null && videoFrameSource == null) || isFinishing) return false
         val frame = latestYoloFrameRef.getAndSet(null) ?: return false
         val frameW = frame.width
         val frameH = frame.height
@@ -3628,38 +3824,26 @@ class DualCameraActivity : AppCompatActivity() {
         }
 
         // Map normalized detection coordinates to the overlay view's coordinate
-        // space using the same aspect-ratio-preserving math as AprilTag.
-        val overlayW = aprilTagOverlay.width.toFloat()
-        val overlayH = aprilTagOverlay.height.toFloat()
-        val cameraAspect = if (frameH > 0) frameW.toFloat() / frameH else 0f
-        val overlayAspect = if (overlayH > 0) overlayW / overlayH else 0f
+        // space using the same top-center fit as the SurfaceView.
+        val mapping = computeOverlayMapping(frameW, frameH)
+        val renderedW = mapping.renderedW
+        val renderedH = mapping.renderedH
+        val offsetX = mapping.offsetX
 
-        val renderedW: Float
-        val renderedH: Float
-        val offsetX: Float
-        val offsetY: Float
-        if (overlayW <= 0 || overlayH <= 0 || cameraAspect <= 0f) {
-            renderedW = overlayW
-            renderedH = overlayH
-            offsetX = 0f
-            offsetY = 0f
-        } else if (overlayAspect > cameraAspect) {
-            renderedH = overlayH
-            renderedW = renderedH * cameraAspect
-            offsetX = (overlayW - renderedW) / 2f
-            offsetY = 0f
-        } else {
-            renderedW = overlayW
-            renderedH = renderedW / cameraAspect
-            offsetX = 0f
-            offsetY = (overlayH - renderedH) / 2f
-        }
-
+        val mirrorH = cameraPreviewMirrorH
         val overlayDetections = detections.map { d ->
-            val left = offsetX + d.rect.left * renderedW
-            val top = offsetY + d.rect.top * renderedH
-            val right = offsetX + d.rect.right * renderedW
-            val bottom = offsetY + d.rect.bottom * renderedH
+            val left = if (mirrorH && renderedW > 0f) {
+                offsetX + renderedW - d.rect.right * renderedW
+            } else {
+                offsetX + d.rect.left * renderedW
+            }
+            val right = if (mirrorH && renderedW > 0f) {
+                offsetX + renderedW - d.rect.left * renderedW
+            } else {
+                offsetX + d.rect.right * renderedW
+            }
+            val top = d.rect.top * renderedH
+            val bottom = d.rect.bottom * renderedH
             AprilTagOverlayView.YoloDetection(d.label, d.confidence, RectF(left, top, right, bottom))
         }
 
@@ -3679,7 +3863,7 @@ class DualCameraActivity : AppCompatActivity() {
      * save; this expensive conversion is only done when needed.
      */
     private fun updateLiveAprilTagOverlay() {
-        if (currentCamera == null || isFinishing) return
+        if ((currentCamera == null && videoFrameSource == null) || isFinishing) return
         val frame = previewFrameQueue.poll() ?: return
         val frameW = frame.width
         val frameH = frame.height
@@ -3714,45 +3898,18 @@ class DualCameraActivity : AppCompatActivity() {
         }
 
         // Map detections from detection-frame coordinates to the overlay view's
-        // coordinate space. AspectRatioSurfaceView preserves the camera aspect ratio
-        // and fits the video inside the container with top|center_horizontal gravity,
-        // so the active video area is a centered, aspect-ratio-preserving rectangle.
-        val overlayW = aprilTagOverlay.width.toFloat()
-        val overlayH = aprilTagOverlay.height.toFloat()
-        val cameraAspect = if (detectH > 0) detectW.toFloat() / detectH else 0f
-        val overlayAspect = if (overlayH > 0) overlayW / overlayH else 0f
-
-        // Compute the rendered video rectangle within the overlay (uniform scale).
-        val renderedW: Float
-        val renderedH: Float
-        val offsetX: Float
-        val offsetY: Float
-        if (overlayW <= 0 || overlayH <= 0 || cameraAspect <= 0f) {
-            renderedW = overlayW
-            renderedH = overlayH
-            offsetX = 0f
-            offsetY = 0f
-        } else if (overlayAspect > cameraAspect) {
-            // Container is wider than camera: fit to height, letterbox left/right.
-            renderedH = overlayH
-            renderedW = renderedH * cameraAspect
-            offsetX = (overlayW - renderedW) / 2f
-            offsetY = 0f
-        } else {
-            // Container is taller than camera (or same aspect): fit to width, letterbox top/bottom.
-            renderedW = overlayW
-            renderedH = renderedW / cameraAspect
-            offsetX = (overlayW - renderedW) / 2f
-            offsetY = 0f
-        }
-
+        // coordinate space using the same top-center fit as the SurfaceView.
+        val mapping = computeOverlayMapping(detectW, detectH)
+        val renderedW = mapping.renderedW
+        val renderedH = mapping.renderedH
+        val offsetX = mapping.offsetX
         val scale = if (detectW > 0) renderedW / detectW else if (detectH > 0) renderedH / detectH else 1f
 
         val mirrorH = cameraPreviewMirrorH
         val overlayDetections = stableDetections.map { d ->
             val mappedCorners = d.corners.map { (x, y) ->
                 var vx = offsetX + x * scale
-                val vy = offsetY + y * scale
+                val vy = y * scale
                 if (mirrorH && renderedW > 0f) {
                     vx = offsetX + renderedW - (x * scale)
                 }
@@ -4026,6 +4183,15 @@ class DualCameraActivity : AppCompatActivity() {
         lastFpsReset.set(now)
         currentFps = if (elapsed > 0) ((count * 1000) / elapsed).toInt() else 0
         Log.d(TAG, "FPS: $currentFps")
+
+        if (videoTestMode) {
+            val w = videoTestFrameWidth.takeIf { it > 0 } ?: PREVIEW_WIDTH
+            val h = videoTestFrameHeight.takeIf { it > 0 } ?: PREVIEW_HEIGHT
+            runOnUiThread {
+                labelCamera.text = "${w}x${h} @ $currentFps FPS"
+            }
+            return
+        }
 
         val request = currentCamera?.getCameraRequest()
         val previewSize = currentCamera?.getPreviewSize()
@@ -4358,6 +4524,13 @@ class DualCameraActivity : AppCompatActivity() {
             setYoloDetectionEnabled(enabled, source = "intent", persist = false)
         }
 
+        intent.getStringExtra(EXTRA_VIDEO_TEST_PATH)?.let { path ->
+            Log.d(TAG, "EXTRA_VIDEO_TEST_PATH=$path requested")
+            if (!videoTestMode || videoTestPath != path) {
+                enterVideoTestMode(path)
+            }
+        }
+
         if (intent.getBooleanExtra(EXTRA_RECORD_START, false)) {
             val durationMs = intent.getLongExtra(EXTRA_RECORD_DURATION_MS, 0L)
             skipGalleryOnRecordingStop = intent.getBooleanExtra(EXTRA_RECORD_NO_GALLERY, false)
@@ -4382,16 +4555,27 @@ class DualCameraActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
-        cameraClient?.register()
-        mainHandler.post(fpsRunnable)
-        mainHandler.post(diagnosticsRunnable)
-        mainHandler.post(devicePollRunnable)
-        mainHandler.post(cameraHealthCheckRunnable)
-        startMicMeter()
-        startSpkMeter()
-        mainHandler.post(firmwareVersionRunnable)
-        // Keep the thumbnail current with the public MediaStore/Google Photos album.
-        albumThumbnailHandler.post(albumThumbnailRunnable)
+        if (videoTestMode) {
+            mainHandler.post(fpsRunnable)
+            mainHandler.post(diagnosticsRunnable)
+            startMicMeter()
+            startSpkMeter()
+            albumThumbnailHandler.post(albumThumbnailRunnable)
+            if (surfaceCamera.holder.surface?.isValid == true) {
+                startVideoFrameSource()
+            }
+        } else {
+            cameraClient?.register()
+            mainHandler.post(fpsRunnable)
+            mainHandler.post(diagnosticsRunnable)
+            mainHandler.post(devicePollRunnable)
+            mainHandler.post(cameraHealthCheckRunnable)
+            startMicMeter()
+            startSpkMeter()
+            mainHandler.post(firmwareVersionRunnable)
+            // Keep the thumbnail current with the public MediaStore/Google Photos album.
+            albumThumbnailHandler.post(albumThumbnailRunnable)
+        }
     }
 
     override fun onStop() {
@@ -4409,15 +4593,19 @@ class DualCameraActivity : AppCompatActivity() {
         mainHandler.removeCallbacks(cameraHealthCheckRunnable)
         mainHandler.removeCallbacks(firmwareVersionRunnable)
         albumThumbnailHandler.removeCallbacks(albumThumbnailRunnable)
-        currentCamera?.closeCamera()
-        currentCamera = null
-        currentDevice = null
-        currentCtrlBlock = null
-        cameraOpenedTime = 0L
-        releaseCdc()
-        pendingPermissionDevices.clear()
-        isRequestingPermission = false
-        cameraClient?.unRegister()
+        if (videoTestMode) {
+            stopVideoFrameSource()
+        } else {
+            currentCamera?.closeCamera()
+            currentCamera = null
+            currentDevice = null
+            currentCtrlBlock = null
+            cameraOpenedTime = 0L
+            releaseCdc()
+            pendingPermissionDevices.clear()
+            isRequestingPermission = false
+            cameraClient?.unRegister()
+        }
     }
 
     override fun onDestroy() {
@@ -4425,6 +4613,7 @@ class DualCameraActivity : AppCompatActivity() {
         stopLifecycleTest()
         stopLiveAprilTagDetection()
         stopLiveYoloDetection()
+        stopVideoFrameSource()
         try { yoloDetector.close() } catch (_: Exception) { }
         antiBandingTool?.stop()
         antiBandingTool = null

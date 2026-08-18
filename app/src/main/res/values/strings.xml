@@ -7,4 +7,5 @@
     <string name="waiting_for_camera">Waiting for camera…</string>
     <string name="action_enable_apriltag">AprilTag detection</string>
     <string name="action_enable_yolo">Person detection</string>
+    <string name="action_video_test_source">Video test source</string>
 </resources>

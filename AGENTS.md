@@ -342,6 +342,29 @@ There is no CI/CD pipeline, signing config, or app store deployment script in th
 - USB device access relies on the user granting the Android USB permission dialog at runtime.
 - Native libraries from `AndroidUSBCamera` are bundled as AAR dependencies. Keep those dependencies up to date and review ProGuard keep rules if minification is ever enabled.
 
+## Video test source
+
+The app has an in-app "video test source" mode that replays a directory of JPEG frames as a synthetic camera feed. It is useful for validating YOLO person detection and AprilTag detection without an attached UVC camera.
+
+To prepare a test clip:
+
+```bash
+python3 scripts/prepare_yolo_test_video.py
+```
+
+This downloads the default clip (`f6Qu3eeRz4c`) with `yt-dlp`, re-encodes it to 640x480 @ 15 FPS with black-bar padding, and extracts JPEG frames into `scripts/test_video_assets/test_frames/`. The script prints the exact `adb push` and `adb shell am start` commands.
+
+Push the frames to the device and launch test mode:
+
+```bash
+adb shell rm -rf /sdcard/Android/data/com.example.remotesupportheadset/files/TestFrames
+adb push scripts/test_video_assets/test_frames/ /sdcard/Android/data/com.example.remotesupportheadset/files/TestFrames/
+adb shell am start -S -n com.example.remotesupportheadset/.DualCameraActivity \
+    --es video_test_path /sdcard/Android/data/com.example.remotesupportheadset/files/TestFrames/
+```
+
+You can also start the test source from **Settings → Video test source** while the app is running. It stops any open UVC camera and plays the persisted/default frame directory. Still image capture is disabled in video-test mode because it relies on the ESP32 CDC/UVC protocol.
+
 ## Known limitations and gotchas
 
 - The app only runs on ARM devices with USB OTG host support. Emulators will not exercise camera or USB functionality meaningfully.
