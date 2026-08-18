@@ -67,12 +67,14 @@ class Event:
 class LogcatReader:
     """Stream ADB logcat in a background thread and expose parsed events."""
 
-    def __init__(self) -> None:
+    def __init__(self, full_log_path: Optional[Path] = None) -> None:
         self.events: Dict[int, Event] = {}
         self.recent_lines: queue.Queue[str] = queue.Queue(maxsize=10000)
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._proc: Optional[subprocess.Popen] = None
+        self._full_log_path = full_log_path
+        self._full_log_file: Optional[object] = None
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._reader_loop, name="LogcatReader", daemon=True)
@@ -87,10 +89,18 @@ class LogcatReader:
                 pass
         if self._thread is not None:
             self._thread.join(timeout=2.0)
+        if self._full_log_file is not None:
+            try:
+                self._full_log_file.close()
+            except Exception:
+                pass
 
     def _reader_loop(self) -> None:
         # Clear existing logcat first, then stream new entries.
         subprocess.run(["adb", "logcat", "-c"], capture_output=True)
+        if self._full_log_path is not None:
+            self._full_log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._full_log_file = self._full_log_path.open("w", encoding="utf-8", errors="replace")
         cmd = ["adb", "logcat", "-v", "threadtime", "-s", f"{TAG}:V"]
         self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         if self._proc.stdout is None:
@@ -99,6 +109,9 @@ class LogcatReader:
             if self._stop_event.is_set():
                 break
             line = raw.decode("utf-8", errors="replace").rstrip("\n")
+            if self._full_log_file is not None:
+                self._full_log_file.write(line + "\n")
+                self._full_log_file.flush()
             self._parse_line(line)
             # Keep a rolling buffer for stall/failure diagnosis.
             if self.recent_lines.full():
@@ -332,7 +345,7 @@ def main() -> int:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    reader = LogcatReader()
+    reader = LogcatReader(full_log_path=out_dir / "full_logcat.log")
     reader.start()
 
     print("Starting app...")

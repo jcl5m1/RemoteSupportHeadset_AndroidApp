@@ -222,6 +222,16 @@ class DualCameraActivity : AppCompatActivity() {
     private var colorCorrectionMatrix: FloatArray? = null
     private var colorCorrectionEnabled = false
 
+    // Timestamp (elapsedRealtime) of the most recent preview frame that contained
+    // a stable Macbeth chart. Used to skip expensive full-res correction when the
+    // scene does not contain a chart.
+    @Volatile
+    private var lastMacbethFrameTime = 0L
+
+    // How recently a Macbeth chart must have been seen in the preview before we
+    // spend CPU time running full-res Macbeth detection / AWB on a still capture.
+    private val MACBETH_CHART_RECENCY_MS = 30000L
+
     // Runtime CDC command helper (used by analysis tools and still-capture helpers).
     private val cdcCommandHelper by lazy { CdcCommandHelper(this) }
 
@@ -2221,12 +2231,14 @@ class DualCameraActivity : AppCompatActivity() {
         val outEp = cdcOutEndpoint ?: throw RuntimeException("CDC OUT endpoint lost")
         val inEp = cdcInEndpoint ?: throw RuntimeException("CDC IN endpoint lost")
         val captureT0 = SystemClock.elapsedRealtime()
+        val intentT0 = simulatedCaptureStartTime.takeIf { it > 0 } ?: captureT0
 
         Log.d(TAG, "doSingleCapture start: conn=${System.identityHashCode(conn)}, " +
                 "outEp=0x${outEp.address.toString(16)} (max=${outEp.maxPacketSize}), " +
                 "inEp=0x${inEp.address.toString(16)} (max=${inEp.maxPacketSize}), " +
                 "device=${currentDevice?.deviceName}, ctrlBlock=${currentCtrlBlock != null}, " +
-                "lastFrame=${SystemClock.elapsedRealtime() - lastFrameTime}ms ago")
+                "lastFrame=${SystemClock.elapsedRealtime() - lastFrameTime}ms ago, " +
+                "dtIntentToStart=${captureT0 - intentT0}ms")
 
         // Drain stale input
         drainStaleInput(conn, inEp)
@@ -2266,6 +2278,8 @@ class DualCameraActivity : AppCompatActivity() {
         val commandDeadline = System.currentTimeMillis() + 10000L
         var stillLen = -1
         var progressShown = false
+        var tPending: Long = 0
+        var tAfterLen = 0L
 
         while (System.currentTimeMillis() < commandDeadline) {
             val line = readLine(conn, inEp, buffer, commandDeadline) ?: continue
@@ -2275,8 +2289,9 @@ class DualCameraActivity : AppCompatActivity() {
                 line.startsWith("STILL_LEN ") -> {
                     stillLen = line.substring("STILL_LEN ".length).trim().toIntOrNull()
                         ?: throw RuntimeException("Invalid STILL_LEN")
-                    val tAfterLen = SystemClock.elapsedRealtime()
-                    Log.d(TAG, "doSingleCapture STILL_LEN=$stillLen, dtCmdToLen=${tAfterLen - tAfterOut}ms")
+                    tAfterLen = SystemClock.elapsedRealtime()
+                    val dtPendingToLen = if (tPending > 0) tAfterLen - tPending else 0
+                    Log.d(TAG, "doSingleCapture STILL_LEN=$stillLen, dtCmdToLen=${tAfterLen - tAfterOut}ms, dtPendingToLen=${dtPendingToLen}ms")
                     break
                 }
                 line.startsWith("STILL_FAIL") -> {
@@ -2286,6 +2301,7 @@ class DualCameraActivity : AppCompatActivity() {
                     throw RuntimeException("Device busy")
                 }
                 line.startsWith("STILL_PENDING") && !progressShown -> {
+                    tPending = SystemClock.elapsedRealtime()
                     progressShown = true
                     runOnUiThread { Toast.makeText(this, "Still pending...", Toast.LENGTH_SHORT).show() }
                 }
@@ -2326,9 +2342,18 @@ class DualCameraActivity : AppCompatActivity() {
         val tAfterTrailer = SystemClock.elapsedRealtime()
 
         // Save to external app pictures directory
-        val file = saveJpeg(jpegData)
+        val saveTimings = mutableMapOf<String, Long>()
+        val file = saveJpeg(jpegData, saveTimings)
         val tAfterSave = SystemClock.elapsedRealtime()
-        Log.d(TAG, "doSingleCapture complete: total=${tAfterSave - captureT0}ms, dtTrailer=${tAfterTrailer - tAfterPayload}ms, dtSave=${tAfterSave - tAfterTrailer}ms")
+        val dtSaveRaw = saveTimings["saveRaw"] ?: 0
+        val dtCorrect = saveTimings["correct"] ?: 0
+        val dtMetadata = saveTimings["metadata"] ?: 0
+        val dtScan = saveTimings["scan"] ?: 0
+        Log.d(TAG, "doSingleCapture complete: total=${tAfterSave - captureT0}ms, " +
+                "dtIntentToStart=${captureT0 - intentT0}ms, dtDrain=${tAfterDrain - captureT0}ms, " +
+                "dtOut=${tAfterOut - tAfterDrain}ms, dtCmdToLen=${tAfterLen - tAfterOut}ms, " +
+                "dtPayload=${tAfterPayload - tAfterLen}ms, dtTrailer=${tAfterTrailer - tAfterPayload}ms, " +
+                "dtSave=${tAfterSave - tAfterTrailer}ms (raw=${dtSaveRaw}ms correct=${dtCorrect}ms metadata=${dtMetadata}ms scan=${dtScan}ms)")
         runOnUiThread {
             Toast.makeText(this, "Saved: ${file.name}", Toast.LENGTH_SHORT).show()
         }
@@ -2504,6 +2529,8 @@ class DualCameraActivity : AppCompatActivity() {
             exif.setAttribute(ExifInterface.TAG_DATETIME_DIGITIZED, dateTime)
             // correctFullResJpeg() rotates the still image 90° counter-clockwise
             // and applies AWB from the Macbeth chart, so EXIF orientation is normal.
+            // When no Macbeth chart is present the correction step is skipped and
+            // the file is left in the sensor's native orientation.
             exif.setAttribute(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL.toString())
 
             getCurrentLocation()?.let { loc ->
@@ -2525,7 +2552,7 @@ class DualCameraActivity : AppCompatActivity() {
         }
     }
 
-    private fun saveJpeg(data: ByteArray): File {
+    private fun saveJpeg(data: ByteArray, timings: MutableMap<String, Long> = mutableMapOf()): File {
         // Include millisecond precision so rapid captures (and the lifecycle test)
         // never collide on the same filename.
         val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
@@ -2535,14 +2562,34 @@ class DualCameraActivity : AppCompatActivity() {
         if (!appDir.exists()) appDir.mkdirs()
         val file = File(appDir, "IMG_$timeStamp.jpg")
 
+        val t0 = SystemClock.elapsedRealtime()
         FileOutputStream(file).use { it.write(data) }
+        val tAfterRaw = SystemClock.elapsedRealtime()
+        timings["saveRaw"] = tAfterRaw - t0
 
         // Rotate the full-resolution still to upright and apply AWB/colour
-        // correction derived from the Macbeth chart.
-        correctFullResJpeg(file)
+        // correction derived from the Macbeth chart. This is expensive, so only do
+        // it when the live preview has recently seen a stable Macbeth chart.
+        val macbethSeenRecently = SystemClock.elapsedRealtime() - lastMacbethFrameTime < MACBETH_CHART_RECENCY_MS
+        if (macbethSeenRecently) {
+            correctFullResJpeg(file, timings)
+        } else {
+            Log.d(TAG, "Skipping full-res correction for ${file.name}: no Macbeth chart seen in last ${MACBETH_CHART_RECENCY_MS}ms")
+            timings["correct"] = 0
+        }
+        val tAfterCorrect = SystemClock.elapsedRealtime()
+        if (!timings.containsKey("correct")) {
+            timings["correct"] = tAfterCorrect - tAfterRaw
+        }
 
         writeJpegMetadata(file)
+        val tAfterMetadata = SystemClock.elapsedRealtime()
+        timings["metadata"] = tAfterMetadata - tAfterCorrect
+
+        val tScan0 = SystemClock.elapsedRealtime()
         MediaScannerConnection.scanFile(this, arrayOf(file.absolutePath), arrayOf("image/jpeg"), null)
+        timings["scan"] = SystemClock.elapsedRealtime() - tScan0
+
         lastCapturedFile = file
         generateThumbnailAsync(file)
         return file
@@ -2555,7 +2602,8 @@ class DualCameraActivity : AppCompatActivity() {
      * overwritten with the processed image. Large images (>24 MP) are skipped to
      * avoid OOM.
      */
-    private fun correctFullResJpeg(file: File) {
+    private fun correctFullResJpeg(file: File, timings: MutableMap<String, Long> = mutableMapOf()) {
+        val t0 = SystemClock.elapsedRealtime()
         try {
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeFile(file.absolutePath, bounds)
@@ -2626,6 +2674,9 @@ class DualCameraActivity : AppCompatActivity() {
         } catch (e: Exception) {
             Log.e(TAG, "Failed to process ${file.name}", e)
         }
+        val dt = SystemClock.elapsedRealtime() - t0
+        timings["correctFullRes"] = dt
+        Log.d(TAG, "correctFullResJpeg total: ${dt}ms for ${file.name}")
     }
 
     /**
@@ -2978,6 +3029,7 @@ class DualCameraActivity : AppCompatActivity() {
         }
 
         if (frameStableDetections.count { it.id in MACBETH_CORNER_IDS } >= 4) {
+            lastMacbethFrameTime = SystemClock.elapsedRealtime()
             val bitmap = nv21ToBitmap(frame.data, frameW, frameH)
             if (bitmap != null) {
                 val result = MacbethColorCorrector.correctFromAprilTags(bitmap, frameStableDetections)

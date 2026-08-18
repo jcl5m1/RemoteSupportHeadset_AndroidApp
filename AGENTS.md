@@ -193,6 +193,7 @@ The camera preview is rendered with an `AspectRatioSurfaceView` instead of a `Te
 - When all four corner tags of a known chart are stable, the app samples the swatch interiors and solves a 3×4 affine colour-correction matrix in linear light.
 - The fit is hard-constrained so the observed black and white patches map to `(0,0,0)` and `(255,255,255)`, matching the Python reference decoder.
 - Correction is applied automatically once a CCM has been computed; the raw UVC stream is shown before a chart is detected.
+- Full-resolution still JPEGs are only rotated/AWB-corrected when a stable Macbeth chart has been seen in the live preview within the last 30 seconds. This avoids a ~550 ms decode/rotate/re-encode pass on captures that contain no chart.
 
 ## ESP32-P4 firmware flashing
 
@@ -276,7 +277,13 @@ pip install -r requirements.txt
 python3 simulate_capture_lifecycle.py --count 3 --zoom
 ```
 
-For full histogram data use `--count 100` and omit `--zoom` to exercise the plain capture path. The script prints statistics and, if `matplotlib` is installed, writes a histogram PNG.
+For full histogram data use `--count 100` and omit `--zoom` to exercise the plain capture path. The script prints statistics and, if `matplotlib` is installed, writes a histogram PNG. It also saves the full streamed logcat to `<output-dir>/full_logcat.log`.
+
+To break the capture time into per-phase components (intent→start, drain, command, command→`STILL_LEN`, payload, trailer, save) run:
+
+```bash
+python3 scripts/parse_capture_timing.py /tmp/simcap/full_logcat.log
+```
 
 The harness treats `FPS > 0` as the health signal, auto-recovers from a stalled Android USB host by escalating from `svc usb resetUsbPort` to `svc usb enableUsbDataSignal false && svc usb enableUsbDataSignal true`, and decodes logcat with replacement characters so binary CDC/UVC traffic cannot crash the reader. A recent run completed 100 randomized captures with 100/100 success and stream-resume.
 
