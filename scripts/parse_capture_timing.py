@@ -40,6 +40,13 @@ COMPLETE_RE = re.compile(
 SKIP_RE = re.compile(r"Skipping full-res correction for .* no Macbeth chart seen")
 CORRECT_RE = re.compile(r"correctFullResJpeg total: (\d+)ms for (.*)")
 
+# Stall / recovery / failure signatures.
+CDC_OUT_RETRY_RE = re.compile(r"CDC OUT bulkTransfer failed \(attempt (\d+)/(\d+)\)")
+CAPTURE_ATTEMPT_FAIL_RE = re.compile(r"Capture attempt (\d+)/(\d+) failed")
+INCOMPLETE_JPEG_RE = re.compile(r"Incomplete JPEG: got (\d+)/(\d+)")
+USB_RECOVERY_RE = re.compile(r"RECOVER CAMERA|Camera health check FAILED|Camera stack dead|enableUsbDataSignal|resetUsbPort")
+NO_CAMERA_RE = re.compile(r"No camera devices initially found|Could not open CDC port|Camera health check: no camera open")
+
 
 @dataclass
 class TimingRecord:
@@ -74,11 +81,21 @@ class TimingRecord:
         )
 
 
-def parse_log(path: Path) -> List[TimingRecord]:
+@dataclass
+class StallSummary:
+    cdc_out_retries: int
+    capture_attempt_failures: int
+    incomplete_jpeg_events: int
+    usb_recovery_events: int
+    no_camera_events: int
+
+
+def parse_log(path: Path) -> tuple[List[TimingRecord], int, int, List[int], StallSummary]:
     records: List[TimingRecord] = []
     skipped = 0
     corrected = 0
     correct_times: List[int] = []
+    stalls = StallSummary(0, 0, 0, 0, 0)
     with path.open("r", encoding="utf-8", errors="replace") as f:
         for line in f:
             m = COMPLETE_RE.search(line)
@@ -90,7 +107,17 @@ def parse_log(path: Path) -> List[TimingRecord]:
             if cm:
                 corrected += 1
                 correct_times.append(int(cm.group(1)))
-    return records, skipped, corrected, correct_times
+            if CDC_OUT_RETRY_RE.search(line):
+                stalls.cdc_out_retries += 1
+            if CAPTURE_ATTEMPT_FAIL_RE.search(line):
+                stalls.capture_attempt_failures += 1
+            if INCOMPLETE_JPEG_RE.search(line):
+                stalls.incomplete_jpeg_events += 1
+            if USB_RECOVERY_RE.search(line):
+                stalls.usb_recovery_events += 1
+            if NO_CAMERA_RE.search(line):
+                stalls.no_camera_events += 1
+    return records, skipped, corrected, correct_times, stalls
 
 
 def fmt_stats(values: List[int]) -> str:
@@ -109,10 +136,19 @@ def main() -> int:
     parser.add_argument("--csv", type=Path, help="Write parsed records to CSV")
     args = parser.parse_args()
 
-    records, skipped, corrected, correct_times = parse_log(args.logcat)
+    records, skipped, corrected, correct_times, stalls = parse_log(args.logcat)
+
+    print("Stall / recovery summary:")
+    print(f"  CDC OUT bulkTransfer retries:       {stalls.cdc_out_retries}")
+    print(f"  Capture attempt failures:           {stalls.capture_attempt_failures}")
+    print(f"  Incomplete JPEG payload events:     {stalls.incomplete_jpeg_events}")
+    print(f"  USB host recovery / health failures:{stalls.usb_recovery_events}")
+    print(f"  No-camera / CDC-open failures:      {stalls.no_camera_events}")
+    print()
+
     if not records:
-        print("No doSingleCapture complete lines found.")
-        return 1
+        print("No doSingleCapture complete lines found (older log without per-phase timing).")
+        return 0
 
     print(f"Parsed {len(records)} capture completion events")
     print(f"  full-res correction runs: {corrected}")
