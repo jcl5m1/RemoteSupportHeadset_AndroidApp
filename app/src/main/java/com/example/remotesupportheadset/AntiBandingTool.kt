@@ -18,7 +18,8 @@ import java.util.concurrent.CountDownLatch
 class AntiBandingTool(
     private val activity: Activity,
     private val cdcCommandHelper: CdcCommandHelper,
-    private val frameProvider: () -> Bitmap?
+    private val frameProvider: () -> Bitmap?,
+    private val forcedFlickerHz: Int? = null
 ) {
 
     data class Result(
@@ -91,6 +92,10 @@ class AntiBandingTool(
                     flickerHz = flicker
                     log("ESP32 flicker detection: ${flicker} Hz")
                 }
+                forcedFlickerHz?.let { forced ->
+                    log("Overriding flicker frequency: ${forced} Hz (was ${flickerHz} Hz)")
+                    flickerHz = forced
+                }
                 cdcCommandHelper.disableAutoExposure()
                 Thread.sleep(200)
             }
@@ -121,11 +126,18 @@ class AntiBandingTool(
             }
             log("Coarse best: ${coarseBest.first} us metric=${coarseBest.second}")
 
-            // Step 3: fine sweep around the coarse best.
-            val fineRadius = 1000
+            // Step 3: fine sweep around the coarse best (or the nearest flicker null when forced).
+            val (fineCenter, fineRadius) = if (flickerHz > 0 && forcedFlickerHz != null) {
+                val halfPeriodUs = 1_000_000 / (2 * flickerHz)
+                val nearestNull = (kotlin.math.round(coarseBest.first.toFloat() / halfPeriodUs) * halfPeriodUs).toInt()
+                log("Narrow fine sweep around ${nearestNull} us (flicker null for ${flickerHz} Hz)")
+                nearestNull to 600
+            } else {
+                coarseBest.first to 1000
+            }
             val fineStep = 100
-            val fineStart = (coarseBest.first - fineRadius).coerceAtLeast(2000)
-            val fineEnd = (coarseBest.first + fineRadius).coerceAtMost(40000)
+            val fineStart = (fineCenter - fineRadius).coerceAtLeast(2000)
+            val fineEnd = (fineCenter + fineRadius).coerceAtMost(40000)
             val fineResults = mutableListOf<Pair<Int, Float>>()
 
             log("Fine sweep $fineStart..$fineEnd us step $fineStep")

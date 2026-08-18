@@ -127,6 +127,10 @@ class DualCameraActivity : AppCompatActivity() {
         const val EXTRA_ZOOM_CLOSE = "zoom_close"
         /** Intent extra that starts the anti-banding exposure servo immediately. */
         const val EXTRA_ANTI_BAND_NOW = "anti_band_now"
+        /** Intent extra that forces the anti-banding servo to a flicker frequency (50 or 60 Hz). */
+        const val EXTRA_ANTI_BAND_HZ = "anti_band_hz"
+        /** Intent extra that shows or hides the diagnostics panel. */
+        const val EXTRA_DIAGNOSTICS = "diagnostics"
     }
 
     private lateinit var surfaceCamera: AspectRatioSurfaceView
@@ -289,19 +293,23 @@ class DualCameraActivity : AppCompatActivity() {
     private var flashTotalBytes = 0L
     private var flashProgressBytesWritten = 0L
 
-    // Cached firmware build version reported by the ESP32 over CDC.
+    // Cached firmware build version and flicker frequency reported by the ESP32 over CDC.
     @Volatile
     private var firmwareBuildVersion: String? = null
+    @Volatile
+    private var cachedFlickerHz: Int? = null
+    // Flicker frequency from the most recent anti-banding servo run (may be forced).
+    @Volatile
+    private var lastAntiBandingFlickerHz: Int? = null
     private val firmwareVersionRunnable = object : Runnable {
         override fun run() {
-            // The version query opens a separate CDC-ACM connection via
-            // usb-serial-for-android.  Concurrent CDC traffic while a still
-            // capture is running has been observed to stall the capture's own
-            // CDC OUT bulkTransfer, so skip the query until the capture ends.
+            // The status query reuses the activity's CDC bulk endpoints.
+            // Concurrent CDC traffic while a still capture or anti-banding run
+            // is active can stall the data path, so skip the query then.
             if (isCapturing || antiBandingTool?.isRunning == true) {
-                Log.v(TAG, "Firmware version query skipped: ${if (isCapturing) "capture in progress" else "anti-banding in progress"}")
+                Log.v(TAG, "Firmware status query skipped: ${if (isCapturing) "capture in progress" else "anti-banding in progress"}")
             } else {
-                queryFirmwareBuildVersion()
+                queryFirmwareStatus()
             }
             mainHandler.postDelayed(this, FIRMWARE_VERSION_INTERVAL_MS)
         }
@@ -1212,30 +1220,35 @@ class DualCameraActivity : AppCompatActivity() {
     // ESP32-P4 firmware flashing over USB-OTG
     // -------------------------------------------------------------------------
 
-    private fun queryFirmwareBuildVersion() {
+    private fun queryFirmwareStatus() {
         Thread {
             val helper = CdcCommandHelper(this, currentDevice, currentCtrlBlock?.connection, cdcOutEndpoint, cdcInEndpoint)
-            val version = try {
+            var version: String? = null
+            var flickerHz: Int? = null
+            try {
                 if (helper.open()) {
-                    val response = helper.queryBuildVersion()
+                    val versionResponse = helper.queryBuildVersion()
+                    Log.d(TAG, "Firmware version raw response: '$versionResponse'")
+                    version = parseBuildVersion(versionResponse)
+
+                    val statusResponse = helper.queryExposureUs()
+                    Log.d(TAG, "Firmware status raw response: '$statusResponse'")
+                    flickerHz = parseFlickerHz(statusResponse)
                     helper.close()
-                    Log.d(TAG, "Firmware version raw response: '$response'")
-                    parseBuildVersion(response)
                 } else {
-                    Log.d(TAG, "Could not open CDC port for firmware version query")
-                    null
+                    Log.d(TAG, "Could not open CDC port for firmware status query")
                 }
             } catch (e: Exception) {
-                Log.w(TAG, "Failed to query firmware build version", e)
-                null
+                Log.w(TAG, "Failed to query firmware status", e)
             }
             version?.let { firmwareBuildVersion = it }
+            flickerHz?.let { cachedFlickerHz = it }
             if (!isFinishing) {
                 runOnUiThread {
                     firmwareVersionLabel.text = "FW: ${version ?: "--"}"
                 }
             }
-        }.apply { name = "FirmwareVersionQueryThread"; start() }
+        }.apply { name = "FirmwareStatusQueryThread"; start() }
     }
 
     private fun parseBuildVersion(response: String?): String? {
@@ -1246,6 +1259,12 @@ class DualCameraActivity : AppCompatActivity() {
         val raw = match?.groupValues?.get(1)
         // Normalize to yyyymmdd_hhmmss.
         return raw?.replace("-", "_")
+    }
+
+    private fun parseFlickerHz(response: String?): Int? {
+        if (response.isNullOrBlank()) return null
+        val match = Regex("""flicker=(\d+)Hz""").find(response.trim())
+        return match?.groupValues?.get(1)?.toIntOrNull()
     }
 
     private fun checkForLatestFirmware(prefillUrl: String? = null) {
@@ -2126,7 +2145,7 @@ class DualCameraActivity : AppCompatActivity() {
                     }
                     R.id.action_anti_banding -> {
                         Log.d(TAG, "Settings: anti-banding selected")
-                        startOrStopAntiBandingAnalysis()
+                        showAntiBandingDialog()
                         true
                     }
                     else -> false
@@ -2137,11 +2156,39 @@ class DualCameraActivity : AppCompatActivity() {
     }
 
     /**
+     * Show a dialog that lets the user run anti-banding with auto-detected flicker
+     * or forced 50/60 Hz. This is used from the settings menu.
+     */
+    private fun showAntiBandingDialog() {
+        val existing = antiBandingTool
+        if (existing?.isRunning == true) {
+            existing.stop()
+            return
+        }
+        val options = arrayOf("Auto-detect flicker", "Force 50 Hz", "Force 60 Hz")
+        AlertDialog.Builder(this)
+            .setTitle("Anti-banding analysis")
+            .setItems(options) { _, which ->
+                val forcedHz = when (which) {
+                    1 -> 50
+                    2 -> 60
+                    else -> null
+                }
+                startOrStopAntiBandingAnalysis(forcedHz)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    /**
      * Start or stop the anti-banding exposure servo. The servo uses the latest
      * NV21 preview frame (converted to Bitmap) to measure banding while sweeping
      * CSI exposure over CDC-ACM.
+     *
+     * @param forcedHz If non-null, the servo assumes this mains frequency instead
+     *   of relying on the ESP32's own flicker detection.
      */
-    private fun startOrStopAntiBandingAnalysis() {
+    private fun startOrStopAntiBandingAnalysis(forcedHz: Int? = null) {
         val existing = antiBandingTool
         if (existing?.isRunning == true) {
             existing.stop()
@@ -2175,14 +2222,18 @@ class DualCameraActivity : AppCompatActivity() {
                     cdcOutEndpoint,
                     cdcInEndpoint
                 ),
-                frameProvider = { grabLatestPreviewBitmap() }
+                frameProvider = { grabLatestPreviewBitmap() },
+                forcedFlickerHz = forcedHz
             ).also { antiBandingTool = it }
 
             tool.onLog = { message ->
                 runOnUiThread { dialog.setMessage(message) }
             }
             tool.onResult = { result ->
+                cachedFlickerHz = result.flickerHz
+                lastAntiBandingFlickerHz = result.flickerHz
                 runOnUiThread {
+                    if (diagnosticsVisible) updateDiagnostics()
                     dialog.setMessage(
                         "Done.\nFlicker: ${result.flickerHz} Hz\n" +
                                 "ESP32 exposure: ${result.esp32Us.toInt()} us\n" +
@@ -3516,8 +3567,13 @@ class DualCameraActivity : AppCompatActivity() {
         sb.appendLine("  Data IF:    ${if (cdcDataInterface != null) "yes" else "no"}")
         sb.appendLine("  Out EP:     ${if (cdcOutEndpoint != null) "yes" else "no"}")
         sb.appendLine("  In EP:      ${if (cdcInEndpoint != null) "yes" else "no"}")
+        sb.appendLine("  Flicker (firmware):     ${cachedFlickerHz?.let { "$it Hz" } ?: "unknown"}")
+        sb.appendLine("  Flicker (anti-banding): ${lastAntiBandingFlickerHz?.let { "$it Hz" } ?: "not run"}")
 
         diagnosticsText.text = sb.toString()
+        val flickerText = "fw=" + (cachedFlickerHz?.toString() ?: "unknown") +
+                ", ab=" + (lastAntiBandingFlickerHz?.toString() ?: "not run")
+        Log.d(TAG, "Diagnostics updated, $flickerText")
     }
 
     /**
@@ -3655,8 +3711,16 @@ class DualCameraActivity : AppCompatActivity() {
             hideZoomOverlay()
         }
         if (intent.getBooleanExtra(EXTRA_ANTI_BAND_NOW, false)) {
-            Log.d(TAG, "EXTRA_ANTI_BAND_NOW requested")
-            startOrStopAntiBandingAnalysis()
+            val forcedHz = intent.getIntExtra(EXTRA_ANTI_BAND_HZ, 0).let { if (it > 0) it else null }
+            Log.d(TAG, "EXTRA_ANTI_BAND_NOW requested, forcedHz=$forcedHz")
+            startOrStopAntiBandingAnalysis(forcedHz)
+        }
+
+        if (intent.hasExtra(EXTRA_DIAGNOSTICS)) {
+            diagnosticsVisible = intent.getBooleanExtra(EXTRA_DIAGNOSTICS, false)
+            diagnosticsPanel.visibility = if (diagnosticsVisible) View.VISIBLE else View.GONE
+            if (diagnosticsVisible) updateDiagnostics()
+            Log.d(TAG, "EXTRA_DIAGNOSTICS=$diagnosticsVisible")
         }
     }
 
