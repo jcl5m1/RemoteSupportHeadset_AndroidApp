@@ -251,6 +251,11 @@ class DualCameraActivity : AppCompatActivity() {
     @Volatile
     private var lastMacbethFrameTime = 0L
 
+    // Rate-limit CCM update logs so the logcat isn't flooded while a chart
+    // stays in view.
+    private var lastCcmLogTime = 0L
+    private val CCM_LOG_INTERVAL_MS = 5000L
+
     // How recently a Macbeth chart must have been seen in the preview before we
     // spend CPU time running full-res Macbeth detection / AWB on a still capture.
     private val MACBETH_CHART_RECENCY_MS = 30000L
@@ -280,8 +285,8 @@ class DualCameraActivity : AppCompatActivity() {
             val elapsed = SystemClock.elapsedRealtime() - cycleStart
             aprilTagCycleCount++
             val now = SystemClock.elapsedRealtime()
-            if (now - aprilTagLastSummaryTime >= 1000L) {
-                Log.d(TAG, "AprilTag rate: $aprilTagCycleCount cycles/s, last cycle=${elapsed}ms")
+            if (now - aprilTagLastSummaryTime >= 5000L) {
+                Log.v(TAG, "AprilTag rate: $aprilTagCycleCount cycles/5s, last cycle=${elapsed}ms")
                 aprilTagCycleCount = 0
                 aprilTagLastSummaryTime = now
             }
@@ -3179,7 +3184,7 @@ class DualCameraActivity : AppCompatActivity() {
         val trackTime = SystemClock.elapsedRealtime() - trackStart
 
         if (detections.isNotEmpty() || stableDetections.isNotEmpty()) {
-            Log.d(TAG, "AprilTag cycle: frame=${frameW}x${frameH} detect=${detectTime}ms track=${trackTime}ms raw=${detections.size} stable=${stableDetections.size}")
+            Log.v(TAG, "AprilTag cycle: frame=${frameW}x${frameH} detect=${detectTime}ms track=${trackTime}ms raw=${detections.size} stable=${stableDetections.size}")
         }
 
         if (stableDetections.isEmpty()) {
@@ -3256,7 +3261,11 @@ class DualCameraActivity : AppCompatActivity() {
                 if (result != null) {
                     colorCorrectionMatrix = result.ccm
                     colorCorrectionEnabled = true
-                    Log.i(TAG, "Updated CCM from ${result.chartName}, mean error=${result.meanError}")
+                    val now = SystemClock.elapsedRealtime()
+                    if (now - lastCcmLogTime >= CCM_LOG_INTERVAL_MS) {
+                        lastCcmLogTime = now
+                        Log.i(TAG, "Updated CCM from ${result.chartName}, mean error=${result.meanError}")
+                    }
                 }
                 saveDebugPreview(bitmap, frameStableDetections)
             }
