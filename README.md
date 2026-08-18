@@ -11,6 +11,7 @@ Android companion app for the ESP32-P4 wearable webcam. It connects to one or tw
 - **Live microphone input level meter** and **speaker output VU meter** (via the system `Visualizer`).
 - **Full-screen immersive** landscape UI.
 - **AprilTag 16h5 detection** with a temporal stability filter to remove single-frame false positives.
+- **YOLOv8n person detection** via ONNX Runtime Android: optional live bounding-box overlay and automatic annotation of saved still photos.
 - **Macbeth chart colour correction**: detects the same AprilTag-coded charts as `esp32-wearable/tools`, solves a 3×4 affine CCM, and applies it to the preview and saved debug frames.
 - **ESP32-P4 firmware flashing** over USB-OTG from binaries pushed to the device storage.
 - **Google Photos integration**: stills and videos are saved to public MediaStore albums (`Pictures/RemoteSupportHeadset` and `Movies/RemoteSupportHeadset`) that Google Photos syncs automatically; the thumbnail opens the latest item in Google Photos.
@@ -70,7 +71,7 @@ The CMake build under `app/src/main/cpp/` produces two shared libraries:
 5. The **MIC** and **SPK** meters at the bottom show live audio levels.
 6. The **Record** button starts video recording; tap it again to stop. Videos and still captures are saved to public albums synced by Google Photos.
 7. Tap the **thumbnail** at the bottom left to open the latest photo or video in Google Photos.
-8. The **Settings** button opens a menu with **Update firmware** and **Show diagnostics**.
+8. The **Settings** button opens a menu with **Update firmware**, **Show diagnostics**, **AprilTag detection**, and **Person detection** toggles.
 
 ### AprilTag / Macbeth chart detection
 
@@ -81,6 +82,10 @@ Point the camera at one of the supported AprilTag-coded Macbeth charts (layouts 
 - Debug frames are saved to `/sdcard/Android/data/com.example.remotesupportheadset/files/Pictures/DebugPreview/`.
 
 The colour-correction matrix is applied automatically to the live preview once it has been computed.
+
+### Person detection (YOLOv8n)
+
+Enable **Settings → Person detection** to run YOLOv8n inference on the live preview. Detected people are highlighted with red bounding boxes and confidence labels. Person boxes are also burned into still photos before they are saved to the Google Photos album. The feature defaults to off to save battery/CPU.
 
 ### ESP32-P4 firmware update
 

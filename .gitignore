@@ -44,3 +44,9 @@ pulled_images/
 
 # Python virtual environments for host helper scripts
 .venv/
+.venv_onnx/
+
+# Exported / downloaded YOLO model artifacts left in the project root
+yolov8n.pt
+yolov8n.onnx
+yolov8n_*.onnx

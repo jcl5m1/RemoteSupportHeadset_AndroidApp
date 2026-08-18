@@ -5,8 +5,10 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.RectF
 import android.util.AttributeSet
 import android.view.View
+
 
 /**
  * Transparent overlay that draws AprilTag detections on top of the live preview.
@@ -25,7 +27,19 @@ class AprilTagOverlayView @JvmOverloads constructor(
         val corners: List<Pair<Float, Float>>
     )
 
+    data class YoloDetection(
+        val label: String,
+        val confidence: Float,
+        val rect: RectF
+    )
+
     var detections: List<Detection> = emptyList()
+        set(value) {
+            field = value
+            invalidate()
+        }
+
+    var yoloDetections: List<YoloDetection> = emptyList()
         set(value) {
             field = value
             invalidate()
@@ -50,8 +64,32 @@ class AprilTagOverlayView @JvmOverloads constructor(
         strokeWidth = 3f
     }
 
+    private val yoloBoxPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.RED
+        strokeWidth = 5f
+        style = Paint.Style.STROKE
+    }
+
+    private val yoloTextFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.RED
+        textSize = 32f
+        style = Paint.Style.FILL
+    }
+
+    private val yoloTextOutlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.BLACK
+        textSize = 32f
+        style = Paint.Style.STROKE
+        strokeWidth = 4f
+    }
+
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
+        drawAprilTags(canvas)
+        drawYoloDetections(canvas)
+    }
+
+    private fun drawAprilTags(canvas: Canvas) {
         for (d in detections) {
             if (d.corners.size < 4) continue
             val path = Path().apply {
@@ -68,6 +106,20 @@ class AprilTagOverlayView @JvmOverloads constructor(
             val label = "id=${d.id}"
             canvas.drawText(label, cx, cy, textOutlinePaint)
             canvas.drawText(label, cx, cy, textFillPaint)
+        }
+    }
+
+    private fun drawYoloDetections(canvas: Canvas) {
+        for (d in yoloDetections) {
+            val left = d.rect.left * width
+            val top = d.rect.top * height
+            val right = d.rect.right * width
+            val bottom = d.rect.bottom * height
+            canvas.drawRect(left, top, right, bottom, yoloBoxPaint)
+            val label = "${d.label} ${(d.confidence * 100).toInt()}%"
+            val baseline = if (top + yoloTextFillPaint.textSize > yoloTextFillPaint.textSize) top + yoloTextFillPaint.textSize else yoloTextFillPaint.textSize
+            canvas.drawText(label, left + 6f, baseline, yoloTextOutlinePaint)
+            canvas.drawText(label, left + 6f, baseline, yoloTextFillPaint)
         }
     }
 }

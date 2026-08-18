@@ -17,8 +17,10 @@ Key user-facing behavior:
 - Displays live MIC and SPK level meters at the bottom.
 - Provides a single **Record** button that toggles video recording on/off; finished videos and still JPEGs are published to public MediaStore albums (`Pictures/RemoteSupportHeadset` and `Movies/RemoteSupportHeadset`) that Google Photos syncs automatically.
 - The bottom thumbnail shows the most recent photo or video from the synced album; tapping it opens Google Photos (or the system's viewer) to that item.
-- Provides a **Settings** popup with **Update firmware** (download from a URL and reflash ESP32-P4), **Show diagnostics**, and **AprilTag detection** options.
+- Provides a **Settings** popup with **Update firmware** (download from a URL and reflash ESP32-P4), **Show diagnostics**, **AprilTag detection**, and **Person detection** options.
 - Runs AprilTag detection on the live preview only when enabled in Settings; it defaults to off. When enabled, detected tags are overlaid and a colour-correction matrix can be computed from a Macbeth chart.
+- Runs YOLOv8n person detection on the live preview only when enabled in Settings; it defaults to off. When enabled, person bounding boxes are overlaid on the live stream and burned into saved still JPEGs.
+- Runs YOLOv8n person detection on the live preview only when enabled in Settings; it defaults to off. When enabled, person bounding boxes are overlaid on the live stream and burned into saved still JPEGs.
 - Saves debug preview frames when a complete Macbeth chart is detected.
 
 ## Technology stack
@@ -29,7 +31,7 @@ Key user-facing behavior:
 - **UI framework**: AndroidX AppCompat, ConstraintLayout, Material Components.
 - **Architecture**: Single-Activity-style flow; the launcher `DualCameraActivity` contains all runtime logic. There is no MVVM framework, no dependency injection, and no navigation component.
 - **Primary third-party library**: `com.github.jiangdongguo.AndroidUSBCamera` (libausbc + libuvc, version 3.2.7) for UVC camera enumeration, permission handling, and preview.
-- **Computer vision**: AprilTag3 (16h5 family) through a custom JNI wrapper (`libapriltag_jni`).
+- **Computer vision**: AprilTag3 (16h5 family) through a custom JNI wrapper (`libapriltag_jni`); YOLOv8n person detection via ONNX Runtime Android.
 - **Firmware flashing**: `esp-serial-flasher` through a custom JNI wrapper (`libesp32flasher`).
 - **Runtime CDC commands**: `usb-serial-for-android` is used to open the ESP32-P4's CDC-ACM interface (when not already exclusively owned by the UVC stack) so the app can send exposure commands for the anti-banding servo.
 - **Audio APIs**:
@@ -72,6 +74,7 @@ RemoteSupportHeadset_AndroidApp/
 │   │   │   ├── BandingAnalyzer.kt          # Vertical-slice banding metric from preview frames
 │   │   │   ├── AntiBandingTool.kt          # Stand-alone exposure-servo analysis tool (not auto-run)
 │   │   │   ├── CdcCommandHelper.kt         # USB CDC-ACM sender for runtime ESP32 commands
+│   │   │   ├── YoloPersonDetector.kt       # ONNX Runtime YOLOv8n person detector
 │   │   │   └── ReceiverExportWorkaroundContext.kt  # Android 14 receiver export workaround
 │       │   └── res/
 │       │       ├── layout/
@@ -99,6 +102,7 @@ The application runtime is contained mostly in `DualCameraActivity.kt`. The main
 3. **UI state and gestures** — overlay visibility, zoom toggling, key-event logging, flash-progress dialog, settings popup menu, and the album thumbnail that refreshes from the public MediaStore album and opens Google Photos on tap.
 4. **Audio metering** — `startMicMeter`, `startSpeakerMeter`, and their cleanup counterparts.
 5. **AprilTag detection** — periodic capture of the preview bitmap, `AprilTagDetector.detect()`, `AprilTagTracker` filtering, and overlay rendering.
+6. **YOLO person detection** — optional, settings-toggled. Runs YOLOv8n inference via ONNX Runtime on the NV21 preview frame in a dedicated background thread, maps detections to overlay coordinates, and annotates saved still JPEGs.
 6. **Macbeth colour correction** — when a supported chart is detected, `MacbethColorCorrector.correctFromAprilTags()` solves a 3×4 affine CCM and applies it automatically to the preview and saved debug frames.
 7. **Firmware flashing** — `startFirmwareFlashFlow()` finds `/Firmware/{bootloader.bin,partition-table.bin,usb_webcam.bin}` under `getExternalFilesDir(null)` and flashes them with `Esp32Flasher`.
 8. **Media publishing** — finished still captures (`saveJpeg()`) are copied into the public `Pictures/RemoteSupportHeadset` album via MediaStore and the app-private copy is deleted; videos (`finishRecordingFlow()`) are copied into `Movies/RemoteSupportHeadset` the same way. **Debug preview save** — `saveDebugPreview()` still writes `win_raw.jpg`, `win_annotated.jpg`, and optionally `win_corrected.jpg` to the app-private `Pictures/DebugPreview` folder.
@@ -189,6 +193,17 @@ The camera preview is rendered with an `AspectRatioSurfaceView` instead of a `Te
 - Detections are passed through `AprilTagTracker`, which requires a tag to be present in a small spatial window for several consecutive frames before it is reported as stable. The tracker's `maxPositionJumpPx` is set relative to the detection resolution.
 - Stable detections are drawn on `AprilTagOverlayView` (a normal View on top of the SurfaceView) and used by the Macbeth chart decoder.
 - Detection runs directly on the upright preview frame. Do not re-introduce orientation permutations in the Android app; orientation is corrected in the ESP32 firmware.
+
+## YOLO person detection
+
+- Model: **Ultralytics YOLOv8n** exported to ONNX at 320×320, bundled as `app/src/main/assets/yolov8n-person-320.onnx`.
+- Runtime: **ONNX Runtime Android** (`com.microsoft.onnxruntime:onnxruntime-android`).
+- Detection defaults to **off** and is toggled from **Settings → Person detection**.
+- The NV21 preview frame is converted to an ARGB `Bitmap` and run through `YoloPersonDetector` on a dedicated `HandlerThread("YoloLive")`.
+- Only COCO class **0 (person)** is reported; all other classes are discarded.
+- Detections are mapped to overlay view coordinates and drawn as red boxes with confidence labels on `AprilTagOverlayView`.
+- Saved still JPEGs are annotated with the same person boxes before being published to the Google Photos album.
+- Inference time and person count are shown in the diagnostics panel when the feature is enabled.
 
 ## Macbeth colour correction
 

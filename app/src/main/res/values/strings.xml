@@ -5,4 +5,6 @@
     <string name="label_camera_1">Camera 1</string>
     <string name="label_camera_2">Camera 2</string>
     <string name="waiting_for_camera">Waiting for camera…</string>
+    <string name="action_enable_apriltag">AprilTag detection</string>
+    <string name="action_enable_yolo">Person detection</string>
 </resources>

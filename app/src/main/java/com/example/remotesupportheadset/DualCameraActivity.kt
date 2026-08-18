@@ -143,11 +143,15 @@ class DualCameraActivity : AppCompatActivity() {
         const val EXTRA_RECORD_NO_GALLERY = "record_no_gallery"
         /** Intent extra that enables or disables live AprilTag detection (overrides the saved preference). */
         const val EXTRA_APRILTAG_ENABLED = "apriltag_enabled"
+        /** Intent extra that enables or disables live YOLO person detection (overrides the saved preference). */
+        const val EXTRA_YOLO_ENABLED = "yolo_enabled"
 
         /** SharedPreferences file used for persistent app settings. */
         private const val PREFS_NAME = "RemoteSupportHeadsetPrefs"
         /** SharedPreferences key for the live AprilTag detection toggle. */
         private const val PREF_APRILTAG_ENABLED = "apriltag_enabled"
+        /** SharedPreferences key for the live YOLO person detection toggle. */
+        private const val PREF_YOLO_ENABLED = "yolo_enabled"
         /** SharedPreferences key for the forced flicker-frequency mode. */
         private const val PREF_FLICKER_MODE = "flicker_mode"
         /** Flicker mode values. */
@@ -243,6 +247,19 @@ class DualCameraActivity : AppCompatActivity() {
     private var previewFrameWidth = 0
     private var previewFrameHeight = 0
     private data class PreviewFrame(val data: ByteArray, val width: Int, val height: Int)
+
+    // YOLO person detection pipeline.
+    private val yoloDetector by lazy { YoloPersonDetector(this) }
+    /** Whether live YOLO person detection is enabled. */
+    private var yoloDetectionEnabled = false
+    private var yoloThread: android.os.HandlerThread? = null
+    private var yoloHandler: Handler? = null
+    private var yoloCycleCount = 0L
+    private var yoloLastSummaryTime = 0L
+    private var yoloLastInferenceTime = 0L
+    private var yoloLastDetectionCount = 0
+    /** Most recent preview frame shared with the YOLO detection thread. */
+    private val latestYoloFrameRef = java.util.concurrent.atomic.AtomicReference<PreviewFrame>()
 
     // 3x3 colour-correction matrix computed from a detected Macbeth chart.
     private var colorCorrectionMatrix: FloatArray? = null
@@ -499,6 +516,9 @@ class DualCameraActivity : AppCompatActivity() {
                 val copy = data.copyOf()
                 previewFrameQueue.poll()?.let { }
                 previewFrameQueue.offer(PreviewFrame(copy, previewSize.width, previewSize.height))
+                // Also share the latest frame with the YOLO thread. The thread copies
+                // the data before converting to a Bitmap, so a single reference is safe.
+                latestYoloFrameRef.set(PreviewFrame(copy.copyOf(), previewSize.width, previewSize.height))
                 // Log a sample frame every ~60 frames (about once per second).
                 val count = frameCount.get()
                 if (count % 60L == 0L) {
@@ -576,6 +596,17 @@ class DualCameraActivity : AppCompatActivity() {
         } else {
             aprilTagOverlay.detections = emptyList()
             Log.d(TAG, "Live AprilTag detection disabled by default")
+        }
+
+        // Live YOLO person detection is also optional and defaults to off.
+        yoloDetectionEnabled = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            .getBoolean(PREF_YOLO_ENABLED, false)
+        Log.d(TAG, "YOLO pref loaded: enabled=$yoloDetectionEnabled")
+        if (yoloDetectionEnabled) {
+            startLiveYoloDetection()
+        } else {
+            aprilTagOverlay.yoloDetections = emptyList()
+            Log.d(TAG, "Live YOLO detection disabled by default")
         }
 
         // Load the persisted flicker-frequency preference. It is sent to the
@@ -2421,12 +2452,17 @@ class DualCameraActivity : AppCompatActivity() {
             menuInflater.inflate(R.menu.menu_settings, menu)
             menu.findItem(R.id.action_diagnostics)?.isChecked = diagnosticsVisible
             menu.findItem(R.id.action_enable_apriltag)?.isChecked = aprilTagDetectionEnabled
+            menu.findItem(R.id.action_enable_yolo)?.isChecked = yoloDetectionEnabled
             menu.findItem(R.id.action_anti_banding)?.title =
                 if (antiBandingTool?.isRunning == true) "Stop anti-banding" else "Anti-banding analysis"
             setOnMenuItemClickListener { item ->
                 when (item.itemId) {
                     R.id.action_enable_apriltag -> {
                         setAprilTagDetectionEnabled(!aprilTagDetectionEnabled, source = "settings", persist = true)
+                        true
+                    }
+                    R.id.action_enable_yolo -> {
+                        setYoloDetectionEnabled(!yoloDetectionEnabled, source = "settings", persist = true)
                         true
                     }
                     R.id.action_update_firmware -> {
@@ -3297,13 +3333,33 @@ class DualCameraActivity : AppCompatActivity() {
                 rotated
             }
 
+            // Optionally burn YOLO person detections into the saved JPEG.
+            val annotated = if (yoloDetectionEnabled) {
+                try {
+                    val detections = yoloDetector.detect(processed)
+                    if (detections.isNotEmpty()) {
+                        Log.i(TAG, "Annotating ${file.name} with ${detections.size} person detections")
+                        val drawn = yoloDetector.drawDetections(processed, detections)
+                        processed.recycle()
+                        drawn
+                    } else {
+                        processed
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "YOLO annotation failed for ${file.name}", e)
+                    processed
+                }
+            } else {
+                processed
+            }
+
             // Write to a temporary file first so a crash/OOM mid-compress does not
             // leave the original capture truncated or corrupted.
             val tempFile = File(file.parent, "${file.name}.tmp")
             FileOutputStream(tempFile).use { out ->
-                processed.compress(Bitmap.CompressFormat.JPEG, 95, out)
+                annotated.compress(Bitmap.CompressFormat.JPEG, 95, out)
             }
-            processed.recycle()
+            annotated.recycle()
             if (!tempFile.renameTo(file)) {
                 tempFile.delete()
                 throw RuntimeException("Failed to replace ${file.name} with processed version")
@@ -3477,6 +3533,138 @@ class DualCameraActivity : AppCompatActivity() {
         aprilTagThread?.quitSafely()
         aprilTagThread = null
         aprilTagHandler = null
+    }
+
+    /**
+     * Enable or disable live YOLO person detection. Defaults to off and can be
+     * toggled from Settings or via the [EXTRA_YOLO_ENABLED] intent extra.
+     */
+    private fun setYoloDetectionEnabled(enabled: Boolean, source: String = "intent", persist: Boolean = true) {
+        if (yoloDetectionEnabled == enabled) return
+        yoloDetectionEnabled = enabled
+        if (persist) {
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .edit()
+                .putBoolean(PREF_YOLO_ENABLED, enabled)
+                .apply()
+        }
+        if (enabled) {
+            startLiveYoloDetection()
+        } else {
+            stopLiveYoloDetection()
+            aprilTagOverlay.yoloDetections = emptyList()
+        }
+        Log.d(TAG, "YOLO detection ${if (enabled) "enabled" else "disabled"} (source=$source, persist=$persist)")
+    }
+
+    private fun startLiveYoloDetection() {
+        if (!yoloDetectionEnabled || yoloThread != null) return
+        val thread = android.os.HandlerThread("YoloLive").apply { start() }
+        yoloThread = thread
+        yoloHandler = Handler(thread.looper)
+        yoloHandler?.post(yoloRunnable)
+        Log.d(TAG, "Live YOLO detection started")
+    }
+
+    private fun stopLiveYoloDetection() {
+        yoloHandler?.removeCallbacks(yoloRunnable)
+        yoloThread?.quitSafely()
+        yoloThread = null
+        yoloHandler = null
+    }
+
+    private val yoloRunnable = object : Runnable {
+        override fun run() {
+            if (isFinishing) return
+            val cycleStart = SystemClock.elapsedRealtime()
+            val hadFrame = updateLiveYoloOverlay()
+            val elapsed = SystemClock.elapsedRealtime() - cycleStart
+            yoloCycleCount++
+            val now = SystemClock.elapsedRealtime()
+            if (now - yoloLastSummaryTime >= 5000L) {
+                Log.v(TAG, "YOLO rate: $yoloCycleCount cycles/5s, last cycle=${elapsed}ms")
+                yoloCycleCount = 0
+                yoloLastSummaryTime = now
+            }
+            // If no new preview frame was available, pace the loop so we don't
+            // spin; otherwise run the next inference as soon as possible.
+            val delay = if (hadFrame) 0L else 33L
+            yoloHandler?.postDelayed(this, delay)
+        }
+    }
+
+    /**
+     * Grab the latest NV21 preview frame, convert it to a colour Bitmap, run the
+     * YOLOv8n person detector, and update the overlay with the resulting boxes.
+     */
+    private fun updateLiveYoloOverlay(): Boolean {
+        if (currentCamera == null || isFinishing) return false
+        val frame = latestYoloFrameRef.getAndSet(null) ?: return false
+        val frameW = frame.width
+        val frameH = frame.height
+
+        val bitmap = nv21ToBitmap(frame.data, frameW, frameH) ?: run {
+            Log.w(TAG, "YOLO failed to convert NV21 to bitmap")
+            return true
+        }
+
+        val inferStart = SystemClock.elapsedRealtime()
+        val detections = try {
+            yoloDetector.detect(bitmap)
+        } catch (e: Exception) {
+            Log.w(TAG, "YOLO inference failed", e)
+            bitmap.recycle()
+            return true
+        }
+        val inferTime = SystemClock.elapsedRealtime() - inferStart
+        yoloLastInferenceTime = inferTime
+        yoloLastDetectionCount = detections.size
+
+        bitmap.recycle()
+
+        if (detections.isEmpty()) {
+            runOnUiThread { aprilTagOverlay.yoloDetections = emptyList() }
+            return true
+        }
+
+        // Map normalized detection coordinates to the overlay view's coordinate
+        // space using the same aspect-ratio-preserving math as AprilTag.
+        val overlayW = aprilTagOverlay.width.toFloat()
+        val overlayH = aprilTagOverlay.height.toFloat()
+        val cameraAspect = if (frameH > 0) frameW.toFloat() / frameH else 0f
+        val overlayAspect = if (overlayH > 0) overlayW / overlayH else 0f
+
+        val renderedW: Float
+        val renderedH: Float
+        val offsetX: Float
+        val offsetY: Float
+        if (overlayW <= 0 || overlayH <= 0 || cameraAspect <= 0f) {
+            renderedW = overlayW
+            renderedH = overlayH
+            offsetX = 0f
+            offsetY = 0f
+        } else if (overlayAspect > cameraAspect) {
+            renderedH = overlayH
+            renderedW = renderedH * cameraAspect
+            offsetX = (overlayW - renderedW) / 2f
+            offsetY = 0f
+        } else {
+            renderedW = overlayW
+            renderedH = renderedW / cameraAspect
+            offsetX = 0f
+            offsetY = (overlayH - renderedH) / 2f
+        }
+
+        val overlayDetections = detections.map { d ->
+            val left = offsetX + d.rect.left * renderedW
+            val top = offsetY + d.rect.top * renderedH
+            val right = offsetX + d.rect.right * renderedW
+            val bottom = offsetY + d.rect.bottom * renderedH
+            AprilTagOverlayView.YoloDetection(d.label, d.confidence, RectF(left, top, right, bottom))
+        }
+
+        runOnUiThread { aprilTagOverlay.yoloDetections = overlayDetections }
+        return true
     }
 
     /**
@@ -4000,6 +4188,9 @@ class DualCameraActivity : AppCompatActivity() {
 
         sb.appendLine("VIDEO PROCESSING PIPELINE")
         sb.appendLine("  AprilTag detection: ${if (aprilTagDetectionEnabled) "enabled" else "disabled"}")
+        sb.appendLine("  Person detection:   ${if (yoloDetectionEnabled) "enabled" else "disabled"}${
+            if (yoloDetectionEnabled) " (last=${yoloLastInferenceTime}ms, persons=$yoloLastDetectionCount)" else ""
+        }")
         sb.appendLine()
 
         sb.appendLine("CDC STATUS")
@@ -4161,6 +4352,12 @@ class DualCameraActivity : AppCompatActivity() {
             setAprilTagDetectionEnabled(enabled, source = "intent", persist = false)
         }
 
+        if (intent.hasExtra(EXTRA_YOLO_ENABLED)) {
+            val enabled = intent.getBooleanExtra(EXTRA_YOLO_ENABLED, false)
+            Log.d(TAG, "EXTRA_YOLO_ENABLED=$enabled requested (transient override)")
+            setYoloDetectionEnabled(enabled, source = "intent", persist = false)
+        }
+
         if (intent.getBooleanExtra(EXTRA_RECORD_START, false)) {
             val durationMs = intent.getLongExtra(EXTRA_RECORD_DURATION_MS, 0L)
             skipGalleryOnRecordingStop = intent.getBooleanExtra(EXTRA_RECORD_NO_GALLERY, false)
@@ -4205,6 +4402,7 @@ class DualCameraActivity : AppCompatActivity() {
         stopMicMeter()
         stopSpkMeter()
         stopLiveAprilTagDetection()
+        stopLiveYoloDetection()
         mainHandler.removeCallbacks(fpsRunnable)
         mainHandler.removeCallbacks(diagnosticsRunnable)
         mainHandler.removeCallbacks(devicePollRunnable)
@@ -4226,6 +4424,8 @@ class DualCameraActivity : AppCompatActivity() {
         super.onDestroy()
         stopLifecycleTest()
         stopLiveAprilTagDetection()
+        stopLiveYoloDetection()
+        try { yoloDetector.close() } catch (_: Exception) { }
         antiBandingTool?.stop()
         antiBandingTool = null
         albumThumbnailHandler.removeCallbacks(albumThumbnailRunnable)

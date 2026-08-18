@@ -6,7 +6,11 @@
         android:checkable="true" />
     <item
         android:id="@+id/action_enable_apriltag"
-        android:title="AprilTag detection"
+        android:title="@string/action_enable_apriltag"
+        android:checkable="true" />
+    <item
+        android:id="@+id/action_enable_yolo"
+        android:title="@string/action_enable_yolo"
         android:checkable="true" />
     <item
         android:id="@+id/action_update_firmware"
