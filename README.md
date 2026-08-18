@@ -13,6 +13,7 @@ Android companion app for the ESP32-P4 wearable webcam. It connects to one or tw
 - **AprilTag 16h5 detection** with a temporal stability filter to remove single-frame false positives.
 - **Macbeth chart colour correction**: detects the same AprilTag-coded charts as `esp32-wearable/tools`, solves a 3×4 affine CCM, and applies it to the preview and saved debug frames.
 - **ESP32-P4 firmware flashing** over USB-OTG from binaries pushed to the device storage.
+- **Google Photos integration**: stills and videos are saved to public MediaStore albums (`Pictures/RemoteSupportHeadset` and `Movies/RemoteSupportHeadset`) that Google Photos syncs automatically; the thumbnail opens the latest item in Google Photos.
 - **Debug preview capture** (`win_raw.jpg`, `win_annotated.jpg`, `win_corrected.jpg`) saved when a complete chart is seen.
 - **Anti-banding analysis tool** (`AntiBandingTool`): stand-alone utility that sweeps CSI exposure time and reports the ESP32's auto anti-banding result versus the Android app's image-based optimum over ADB logcat.  Not wired to the normal UI.
 
@@ -67,8 +68,9 @@ The CMake build under `app/src/main/cpp/` produces two shared libraries:
 3. Plug in a second camera if desired — it appears in the right slot.
 4. Tap the screen to show/hide labels and controls.
 5. The **MIC** and **SPK** meters at the bottom show live audio levels.
-6. The **Record** button starts video recording; tap it again to stop.
-7. The **Settings** button opens a menu with **Update firmware** and **Show diagnostics**.
+6. The **Record** button starts video recording; tap it again to stop. Videos and still captures are saved to public albums synced by Google Photos.
+7. Tap the **thumbnail** at the bottom left to open the latest photo or video in Google Photos.
+8. The **Settings** button opens a menu with **Update firmware** and **Show diagnostics**.
 
 ### AprilTag / Macbeth chart detection
 

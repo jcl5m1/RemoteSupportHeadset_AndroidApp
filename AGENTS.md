@@ -15,7 +15,8 @@ Key user-facing behavior:
 - Double-tap a camera feed to toggle zoom; single-tap anywhere to temporarily show labels and controls.
 - Labels, sliders, and the settings button auto-hide after 5 seconds.
 - Displays live MIC and SPK level meters at the bottom.
-- Provides a single **Record** button that toggles video recording on/off.
+- Provides a single **Record** button that toggles video recording on/off; finished videos and still JPEGs are published to public MediaStore albums (`Pictures/RemoteSupportHeadset` and `Movies/RemoteSupportHeadset`) that Google Photos syncs automatically.
+- The bottom thumbnail shows the most recent photo or video from the synced album; tapping it opens Google Photos (or the system's viewer) to that item.
 - Provides a **Settings** popup with **Update firmware** (download from a URL and reflash ESP32-P4), **Show diagnostics**, and **AprilTag detection** options.
 - Runs AprilTag detection on the live preview only when enabled in Settings; it defaults to off. When enabled, detected tags are overlaid and a colour-correction matrix can be computed from a Macbeth chart.
 - Saves debug preview frames when a complete Macbeth chart is detected.
@@ -71,7 +72,6 @@ RemoteSupportHeadset_AndroidApp/
 │   │   │   ├── BandingAnalyzer.kt          # Vertical-slice banding metric from preview frames
 │   │   │   ├── AntiBandingTool.kt          # Stand-alone exposure-servo analysis tool (not auto-run)
 │   │   │   ├── CdcCommandHelper.kt         # USB CDC-ACM sender for runtime ESP32 commands
-│   │   │   ├── PinchZoomPanImageView.kt    # Zoom/pan image view for zoomed chart
 │   │   │   └── ReceiverExportWorkaroundContext.kt  # Android 14 receiver export workaround
 │       │   └── res/
 │       │       ├── layout/
@@ -96,12 +96,12 @@ The application runtime is contained mostly in `DualCameraActivity.kt`. The main
 
 1. **Lifecycle and permissions** (`onCreate`, `checkAndRequestPermissions`, `onRequestPermissionsResult`).
 2. **USB camera client** (`cameraClient`, `IDeviceConnectCallBack` callbacks) — attaches, detaches, permission queues, and camera opening.
-3. **UI state and gestures** — overlay visibility, zoom toggling, key-event logging, flash-progress dialog, settings popup menu.
+3. **UI state and gestures** — overlay visibility, zoom toggling, key-event logging, flash-progress dialog, settings popup menu, and the album thumbnail that refreshes from the public MediaStore album and opens Google Photos on tap.
 4. **Audio metering** — `startMicMeter`, `startSpeakerMeter`, and their cleanup counterparts.
 5. **AprilTag detection** — periodic capture of the preview bitmap, `AprilTagDetector.detect()`, `AprilTagTracker` filtering, and overlay rendering.
 6. **Macbeth colour correction** — when a supported chart is detected, `MacbethColorCorrector.correctFromAprilTags()` solves a 3×4 affine CCM and applies it automatically to the preview and saved debug frames.
 7. **Firmware flashing** — `startFirmwareFlashFlow()` finds `/Firmware/{bootloader.bin,partition-table.bin,usb_webcam.bin}` under `getExternalFilesDir(null)` and flashes them with `Esp32Flasher`.
-8. **Debug preview save** — `saveDebugPreview()` writes `win_raw.jpg`, `win_annotated.jpg`, and optionally `win_corrected.jpg` to `Pictures/DebugPreview`.
+8. **Media publishing** — finished still captures (`saveJpeg()`) are copied into the public `Pictures/RemoteSupportHeadset` album via MediaStore and the app-private copy is deleted; videos (`finishRecordingFlow()`) are copied into `Movies/RemoteSupportHeadset` the same way. **Debug preview save** — `saveDebugPreview()` still writes `win_raw.jpg`, `win_annotated.jpg`, and optionally `win_corrected.jpg` to the app-private `Pictures/DebugPreview` folder.
 9. **Anti-banding tool** — `AntiBandingTool` is a stand-alone analysis utility that grabs a vertical slice of the live preview, computes a banding metric with `BandingAnalyzer`, sweeps CSI exposure time via `CdcCommandHelper` to minimize intensity variation, captures the ESP32's own anti-banding exposure and detected flicker frequency, and emits a structured comparison line to `adb logcat` under the `AntiBandResult` tag.  Frames with mean intensity above ~92 % are rejected so the tool does not converge on an overexposed, clipped image.  It is no longer wired to the main UI or intent auto-start; instantiate and call `start()` from a debug/test path when needed.
 10. **Utility helpers** — `nextFreeSurface`, `shouldRotateDevice`, `processNextPermission`, etc.
 
@@ -233,9 +233,20 @@ If the binaries are already on the phone, `--ez flash_now true` alone starts fla
 
 > The `AntiBandingTool` analysis utility is no longer wired to the main UI or to the `anti_band_now` intent.  Instantiate it from a debug/test path when you need to rerun the exposure sweep; results are still emitted to `adb logcat` under the `AntiBandResult` tag.
 
+## Photo and video storage
+
+Captured stills and recordings are published to public MediaStore albums so they are picked up and synced by Google Photos:
+
+- Still JPEGs: `Pictures/RemoteSupportHeadset/IMG_YYYYMMDD_HHMMSS_nnn.jpg`
+- Videos: `Movies/RemoteSupportHeadset/VID_YYYYMMDD_HHMMSS.mp4`
+
+After a successful MediaStore insert the app-private copy in `/sdcard/Android/data/com.example.remotesupportheadset/files/` is deleted. The bottom thumbnail queries the public album every 2 s and loads the latest image or video thumbnail. Tapping the thumbnail opens that item in Google Photos (`com.google.android.apps.photos`) if installed, falling back to the system's generic viewer.
+
+The custom still-image zoom/pan overlay was removed; zoom, pan, and album browsing are handled by Google Photos.
+
 ## Debug preview capture
 
-Whenever all four corner tags of a Macbeth chart are stable, the app saves a debug frame to:
+Whenever all four corner tags of a Macbeth chart are stable, the app saves a debug frame to the app-private folder:
 
 ```
 /sdcard/Android/data/com.example.remotesupportheadset/files/Pictures/DebugPreview/

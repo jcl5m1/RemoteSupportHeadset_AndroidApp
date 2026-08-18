@@ -6,12 +6,14 @@ import android.app.AlertDialog
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.ContentResolver
+import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.database.Cursor
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
@@ -28,7 +30,6 @@ import android.location.LocationManager
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
-import android.media.MediaScannerConnection
 import android.media.audiofx.Visualizer
 import android.net.Uri
 import android.os.Build
@@ -41,6 +42,7 @@ import android.os.PowerManager
 import android.os.SystemClock
 import android.view.WindowManager
 import android.util.Log
+import android.util.Size
 import androidx.exifinterface.media.ExifInterface
 import android.view.MotionEvent
 import android.view.SurfaceHolder
@@ -103,6 +105,10 @@ class DualCameraActivity : AppCompatActivity() {
         private const val CAMERA_FRAME_TIMEOUT_MS = 4000L
         private const val CAPTURE_GRACE_PERIOD_MS = 15000L
         private const val FIRMWARE_VERSION_INTERVAL_MS = 5000L
+        private const val ALBUM_THUMBNAIL_INTERVAL_MS = 2000L
+
+        /** Public MediaStore album name that Google Photos syncs as a device folder. */
+        private const val GOOGLE_PHOTOS_ALBUM_NAME = "RemoteSupportHeadset"
 
         private const val ACTION_USB_FLASH_PERMISSION = "com.example.remotesupportheadset.USB_FLASH_PERMISSION"
         private const val ESPRESSIF_VID = 0x303A
@@ -121,12 +127,6 @@ class DualCameraActivity : AppCompatActivity() {
         const val EXTRA_SIMULATED_RECORD_INDEX = "simulated_record_index"
         /** Intent extra that runs the still-capture lifecycle test with the given count. */
         const val EXTRA_LIFECYCLE_TEST_COUNT = "lifecycle_test_count"
-        /** Intent extra that runs capture→zoom→close cycles instead of plain captures. */
-        const val EXTRA_LIFECYCLE_ZOOM_TEST = "lifecycle_zoom_test"
-        /** Intent extra that opens the zoom overlay for the last captured image. */
-        const val EXTRA_ZOOM_OPEN = "zoom_open"
-        /** Intent extra that closes the zoom overlay. */
-        const val EXTRA_ZOOM_CLOSE = "zoom_close"
         /** Intent extra that starts the anti-banding exposure servo immediately. */
         const val EXTRA_ANTI_BAND_NOW = "anti_band_now"
         /** Intent extra that forces the anti-banding servo to a flicker frequency (50 or 60 Hz). */
@@ -167,8 +167,6 @@ class DualCameraActivity : AppCompatActivity() {
     private lateinit var recordToggle: Button
     private lateinit var thumbnailLastCapture: ImageView
     private lateinit var thumbnailLabel: TextView
-    private lateinit var zoomOverlay: View
-    private lateinit var zoomImage: PinchZoomPanImageView
     private lateinit var micLevelMeter: ProgressBar
     private lateinit var micLevelLabel: TextView
     private lateinit var spkLevelMeter: ProgressBar
@@ -232,10 +230,8 @@ class DualCameraActivity : AppCompatActivity() {
     // stream; toggling this mirrors the preview surface so the on-screen preview looks correct.
     private var cameraPreviewMirrorH = false
 
-    private var lastCapturedFile: File? = null
+    private var lastCapturedMediaUri: Uri? = null
     private var lastCapturedThumbnail: android.graphics.Bitmap? = null
-    private var lastAnnotatedFull: android.graphics.Bitmap? = null
-    private var lastLiveThumbnail: android.graphics.Bitmap? = null
     private var lastDebugPreviewSaveTime = 0L
     private val aprilTagDetector by lazy { AprilTagDetector() }
     private val aprilTagTracker = AprilTagTracker()
@@ -361,14 +357,14 @@ class DualCameraActivity : AppCompatActivity() {
     @Volatile
     private var cachedLocationTime = 0L
 
-    // Live-view thumbnail update (shown when the still-image zoom overlay is open)
-    private var isZoomOpen = false
-    private val thumbnailUpdateHandler = Handler(Looper.getMainLooper())
-    private val thumbnailUpdateRunnable = object : Runnable {
+    // Periodic refresh of the album thumbnail so it always shows the most recent
+    // photo/video from the public MediaStore/Google Photos album.
+    private val albumThumbnailHandler = Handler(Looper.getMainLooper())
+    private val albumThumbnailRunnable = object : Runnable {
         override fun run() {
-            if (isZoomOpen && !isFinishing) {
-                updateThumbnailWithLiveFrame()
-                thumbnailUpdateHandler.postDelayed(this, 150)
+            if (!isFinishing) {
+                refreshAlbumThumbnail()
+                albumThumbnailHandler.postDelayed(this, ALBUM_THUMBNAIL_INTERVAL_MS)
             }
         }
     }
@@ -557,8 +553,6 @@ class DualCameraActivity : AppCompatActivity() {
         recordToggle = findViewById(R.id.record_toggle)
         thumbnailLastCapture = findViewById(R.id.thumbnail_last_capture)
         thumbnailLabel = findViewById(R.id.thumbnail_label)
-        zoomOverlay = findViewById(R.id.zoom_overlay)
-        zoomImage = findViewById(R.id.zoom_image)
         micLevelMeter = findViewById(R.id.mic_level_meter)
         micLevelLabel = findViewById(R.id.mic_level_label)
         spkLevelMeter = findViewById(R.id.spk_level_meter)
@@ -610,10 +604,15 @@ class DualCameraActivity : AppCompatActivity() {
         }
 
         thumbnailLastCapture.setOnClickListener {
-            if (isZoomOpen) {
-                hideZoomOverlay()
+            // Open the latest item in the Google Photos album.  Google Photos
+            // provides its own viewer/album UI, so we no longer use the custom
+            // zoom overlay.
+            val latest = queryLatestMediaInAlbum(GOOGLE_PHOTOS_ALBUM_NAME)
+                ?: lastCapturedMediaUri?.let { it to "image/jpeg" }
+            if (latest != null) {
+                openInGooglePhotos(latest.first, latest.second)
             } else {
-                lastCapturedFile?.let { showZoomOverlay(it) }
+                Toast.makeText(this, "No photos yet", Toast.LENGTH_SHORT).show()
             }
         }
 
@@ -1018,14 +1017,13 @@ class DualCameraActivity : AppCompatActivity() {
      * zoom with human-like delays, matching the manual tap scenario the user is
      * trying to stabilise.
      */
-    private fun runLifecycleTest(count: Int, zoomMode: Boolean = false) {
+    private fun runLifecycleTest(count: Int) {
         if (lifecycleTestRunning) return
         lifecycleTestRunning = true
         lifecycleSuccess = 0
         lifecycleFail = 0
-        val modeLabel = if (zoomMode) "capture→zoom→close" else "capture"
-        Toast.makeText(this, "Starting $count $modeLabel lifecycle test", Toast.LENGTH_SHORT).show()
-        Log.i(TAG, "Lifecycle test START: count=$count, zoomMode=$zoomMode")
+        Toast.makeText(this, "Starting $count capture lifecycle test", Toast.LENGTH_SHORT).show()
+        Log.i(TAG, "Lifecycle test START: count=$count")
 
         lifecycleTestThread = Thread {
             val start = SystemClock.elapsedRealtime()
@@ -1064,18 +1062,6 @@ class DualCameraActivity : AppCompatActivity() {
                     val ok = captureStillImageWithRetries(3, cancelCheck = { !lifecycleTestRunning })
                     if (ok) {
                         lifecycleSuccess++
-                        if (zoomMode) {
-                            // Give the thumbnail/generation thread a moment, then open zoom.
-                            Thread.sleep(800)
-                            runOnUiThread {
-                                Toast.makeText(this, "Zoom $i/$count", Toast.LENGTH_SHORT).show()
-                                lastCapturedFile?.let { showZoomOverlay(it) }
-                            }
-                            // Keep the zoom open briefly, then close it.
-                            Thread.sleep(1500)
-                            runOnUiThread { hideZoomOverlay() }
-                            Thread.sleep(500)
-                        }
                     } else {
                         lifecycleFail++
                     }
@@ -1303,22 +1289,35 @@ class DualCameraActivity : AppCompatActivity() {
             copyVideoToMediaStore(file)?.let { uri ->
                 publicUris.add(uri)
                 Log.i(TAG, "Copied to MediaStore: ${file.name} -> $uri")
+                // Remove the app-private copy once it is safely in the public album.
+                try {
+                    if (!file.delete()) {
+                        Log.w(TAG, "Failed to delete app-private video ${file.name}")
+                    }
+                    Unit
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error deleting app-private video", e)
+                }
             } ?: Log.w(TAG, "Failed to copy ${file.name} to MediaStore")
         }
 
         val message = if (sessionFiles.size > 1) {
             "Saved ${sessionFiles.size} video segments"
         } else {
-            "Saved video: ${sessionFiles[0].name}"
+            "Saved video: ${sessionFiles.lastOrNull()?.name ?: "none"}"
         }
         Toast.makeText(this, message, Toast.LENGTH_LONG).show()
         Log.i(TAG, message)
         sessionFiles.forEach { Log.i(TAG, "  ${it.name} ${it.length()} bytes") }
 
-        // Open the most recent segment in the default gallery/photos app unless
-        // automation requested otherwise.
+        publicUris.lastOrNull()?.let {
+            lastCapturedMediaUri = it
+            refreshAlbumThumbnail()
+        }
+
+        // Open the most recent segment in Google Photos unless automation requested otherwise.
         if (!skipGalleryOnRecordingStop) {
-            publicUris.lastOrNull()?.let { openVideoInGallery(it) }
+            publicUris.lastOrNull()?.let { openInGooglePhotos(it, "video/mp4") }
         }
     }
 
@@ -2234,16 +2233,173 @@ class DualCameraActivity : AppCompatActivity() {
         }
     }
 
-    private fun openVideoInGallery(uri: Uri) {
+    /**
+     * Copy a finished JPEG into the public MediaStore album so Google Photos can
+     * sync it.  Returns the content URI of the inserted image, or null on failure.
+     */
+    private fun copyImageToMediaStore(file: File): Uri? {
+        val nowMs = System.currentTimeMillis()
+        val loc = getCurrentLocation()
+        val values = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, file.name)
+            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            put(MediaStore.Images.Media.DATE_ADDED, nowMs / 1000)
+            put(MediaStore.Images.Media.DATE_TAKEN, nowMs)
+            loc?.let {
+                put(MediaStore.Images.Media.LATITUDE, it.latitude)
+                put(MediaStore.Images.Media.LONGITUDE, it.longitude)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                put(MediaStore.Images.Media.RELATIVE_PATH, "${Environment.DIRECTORY_PICTURES}/RemoteSupportHeadset")
+                put(MediaStore.Images.Media.IS_PENDING, 1)
+            } else {
+                val dest = File(
+                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES),
+                    "RemoteSupportHeadset/${file.name}"
+                )
+                dest.parentFile?.mkdirs()
+                put(MediaStore.Images.Media.DATA, dest.absolutePath)
+            }
+        }
+        val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            ?: return null
+        return try {
+            contentResolver.openOutputStream(uri)?.use { out ->
+                FileInputStream(file).use { input -> input.copyTo(out) }
+            } ?: throw IllegalStateException("openOutputStream returned null")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                contentResolver.update(
+                    uri,
+                    ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) },
+                    null, null
+                )
+            }
+            Log.i(TAG, "Copied image to MediaStore: ${file.name} -> $uri")
+            uri
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to copy image to MediaStore", e)
+            contentResolver.delete(uri, null, null)
+            null
+        }
+    }
+
+    /**
+     * Open the given media item in Google Photos.  If Google Photos is not
+     * installed or cannot handle the URI, fall back to a generic viewer.
+     */
+    private fun openInGooglePhotos(uri: Uri, mimeType: String) {
         try {
             val intent = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(uri, "video/mp4")
+                setPackage("com.google.android.apps.photos")
+                setDataAndType(uri, mimeType)
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
             }
-            startActivity(intent)
+            if (intent.resolveActivity(packageManager) != null) {
+                startActivity(intent)
+                return
+            }
         } catch (e: Exception) {
-            Log.e(TAG, "No app available to play video", e)
-            Toast.makeText(this, "Video saved to gallery", Toast.LENGTH_SHORT).show()
+            Log.w(TAG, "Failed to open Google Photos for $uri", e)
+        }
+        // Fall back to any app that can view the URI.
+        try {
+            val fallback = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, mimeType)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(fallback)
+        } catch (e: Exception) {
+            Log.e(TAG, "No app available to open $uri", e)
+            Toast.makeText(this, "Saved to Google Photos album", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /**
+     * Find the most recent image or video in the public MediaStore album with
+     * the given display name.  Returns its content URI and MIME type.
+     */
+    private fun queryLatestMediaInAlbum(bucketName: String): Pair<Uri, String>? {
+        val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL)
+        } else {
+            MediaStore.Files.getContentUri("external")
+        }
+        val projection = arrayOf(
+            MediaStore.Files.FileColumns._ID,
+            MediaStore.Files.FileColumns.MEDIA_TYPE,
+            MediaStore.Files.FileColumns.MIME_TYPE
+        )
+        val selection = "${MediaStore.Files.FileColumns.BUCKET_DISPLAY_NAME} = ? AND " +
+                "(${MediaStore.Files.FileColumns.MEDIA_TYPE} = ? OR ${MediaStore.Files.FileColumns.MEDIA_TYPE} = ?)"
+        val selectionArgs = arrayOf(
+            bucketName,
+            MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE.toString(),
+            MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO.toString()
+        )
+        val sortOrder = "${MediaStore.Files.FileColumns.DATE_ADDED} DESC"
+        var cursor: Cursor? = null
+        return try {
+            cursor = contentResolver.query(collection, projection, selection, selectionArgs, sortOrder)
+            if (cursor != null && cursor.moveToFirst()) {
+                val id = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns._ID))
+                val mimeType = cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.MIME_TYPE))
+                    ?: "image/jpeg"
+                val uri = ContentUris.withAppendedId(collection, id)
+                uri to mimeType
+            } else {
+                null
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to query latest media in album $bucketName", e)
+            null
+        } finally {
+            cursor?.close()
+        }
+    }
+
+    /**
+     * Load a thumbnail for the given media URI on a background thread and
+     * deliver it to the callback on the main thread.
+     */
+    private fun loadAlbumThumbnail(uri: Uri, callback: (Bitmap) -> Unit) {
+        Thread {
+            val bitmap = try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    contentResolver.loadThumbnail(uri, android.util.Size(256, 256), null)
+                } else {
+                    // Pre-Q fallback: ask MediaStore for a mini thumbnail.
+                    val id = ContentUris.parseId(uri)
+                    MediaStore.Images.Thumbnails.getThumbnail(
+                        contentResolver, id, MediaStore.Images.Thumbnails.MINI_KIND, null
+                    ) ?: MediaStore.Video.Thumbnails.getThumbnail(
+                        contentResolver, id, MediaStore.Video.Thumbnails.MINI_KIND, null
+                    )
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to load thumbnail for $uri", e)
+                null
+            }
+            bitmap?.let {
+                runOnUiThread { callback(it) }
+            }
+        }.start()
+    }
+
+    /**
+     * Update the thumbnail ImageView to show the latest item from the public
+     * MediaStore/Google Photos album.  Called after each capture and on a timer.
+     */
+    private fun refreshAlbumThumbnail() {
+        val (uri, _) = queryLatestMediaInAlbum(GOOGLE_PHOTOS_ALBUM_NAME) ?: return
+        loadAlbumThumbnail(uri) { bitmap ->
+            if (isFinishing) {
+                bitmap.recycle()
+                return@loadAlbumThumbnail
+            }
+            val previous = lastCapturedThumbnail
+            lastCapturedThumbnail = bitmap
+            thumbnailLastCapture.setImageBitmap(bitmap)
+            previous?.takeIf { !it.isRecycled }?.recycle()
         }
     }
 
@@ -3035,12 +3191,27 @@ class DualCameraActivity : AppCompatActivity() {
         val tAfterMetadata = SystemClock.elapsedRealtime()
         timings["metadata"] = tAfterMetadata - tAfterCorrect
 
-        val tScan0 = SystemClock.elapsedRealtime()
-        MediaScannerConnection.scanFile(this, arrayOf(file.absolutePath), arrayOf("image/jpeg"), null)
-        timings["scan"] = SystemClock.elapsedRealtime() - tScan0
+        // Publish the finished JPEG to the public MediaStore album.  Google Photos
+        // will sync the "RemoteSupportHeadset" folder.  Once the copy succeeds the
+        // app-private copy is removed so we don't keep duplicates.
+        val tPublish0 = SystemClock.elapsedRealtime()
+        val mediaUri = copyImageToMediaStore(file)
+        timings["publish"] = SystemClock.elapsedRealtime() - tPublish0
+        if (mediaUri != null) {
+            lastCapturedMediaUri = mediaUri
+            try {
+                if (file.exists() && !file.delete()) {
+                    Log.w(TAG, "Failed to delete app-private JPEG ${file.name}")
+                }
+                Unit
+            } catch (e: Exception) {
+                Log.w(TAG, "Error deleting app-private JPEG", e)
+            }
+        } else {
+            Log.w(TAG, "Keeping app-private JPEG because MediaStore publish failed")
+        }
 
-        lastCapturedFile = file
-        generateThumbnailAsync(file)
+        refreshAlbumThumbnail()
         return file
     }
 
@@ -3170,141 +3341,6 @@ class DualCameraActivity : AppCompatActivity() {
         return emptyList()
     }
 
-    private fun generateThumbnailAsync(file: File) {
-        Thread {
-            try {
-                val options = BitmapFactory.Options().apply {
-                    inJustDecodeBounds = true
-                }
-                BitmapFactory.decodeFile(file.absolutePath, options)
-                // Preserve the captured image's aspect ratio; the rotated full-res
-                // still is portrait (e.g. 1944x2592), so a fixed 4:3 thumbnail was
-                // stretching it. Use a fixed max height and a proportional width.
-                val maxThumbHeight = 192
-                val srcWidth = options.outWidth
-                val srcHeight = options.outHeight
-                val targetHeight = maxThumbHeight
-                val targetWidth = if (srcHeight > 0) {
-                    (srcWidth * targetHeight / srcHeight.toFloat()).toInt().coerceAtLeast(1)
-                } else {
-                    (targetHeight * 4 / 3f).toInt()
-                }
-                val sampleSize = calculateInSampleSize(srcWidth, srcHeight, targetWidth, targetHeight)
-                val decodeOptions = BitmapFactory.Options().apply {
-                    inSampleSize = sampleSize
-                }
-                val bitmap = BitmapFactory.decodeFile(file.absolutePath, decodeOptions)
-                    ?: return@Thread
-
-                // Detect AprilTags and draw overlays on the decoded image only when
-                // the AprilTag video-processing pipeline is enabled.  When disabled,
-                // the still image and thumbnail are shown without tag overlays.
-                val (detections, annotated) = if (aprilTagDetectionEnabled) {
-                    try {
-                        aprilTagDetector.detect(bitmap, annotate = true)
-                    } catch (e: Exception) {
-                        Log.e(TAG, "AprilTag detection failed", e)
-                        emptyList<AprilTagDetector.Detection>() to null
-                    }
-                } else {
-                    emptyList<AprilTagDetector.Detection>() to null
-                }
-                if (detections.isNotEmpty()) {
-                    Log.i(TAG, "AprilTag detections: ${detections.map { it.id }}")
-                }
-                val sourceForThumbnail = annotated ?: bitmap
-                val thumbnail = Bitmap.createScaledBitmap(sourceForThumbnail, targetWidth, targetHeight, true)
-
-                // Keep the annotated full image for the zoom overlay. Recycle the
-                // previous one first so we don't accumulate full-resolution bitmaps.
-                lastAnnotatedFull?.takeIf { !it.isRecycled }?.recycle()
-                lastAnnotatedFull = annotated ?: BitmapFactory.decodeFile(file.absolutePath)
-
-                // The original decoded bitmap is no longer needed; ownership of the
-                // annotated image has been transferred to lastAnnotatedFull.
-                bitmap.recycle()
-
-                lastCapturedThumbnail = thumbnail
-                runOnUiThread {
-                    if (!isZoomOpen) {
-                        thumbnailLastCapture.setImageBitmap(thumbnail)
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to generate thumbnail", e)
-            }
-        }.start()
-    }
-
-    private fun calculateInSampleSize(srcWidth: Int, srcHeight: Int, reqWidth: Int, reqHeight: Int): Int {
-        var inSampleSize = 1
-        if (srcHeight > reqHeight || srcWidth > reqWidth) {
-            val halfHeight = srcHeight / 2
-            val halfWidth = srcWidth / 2
-            while (halfWidth / inSampleSize >= reqWidth && halfHeight / inSampleSize >= reqHeight) {
-                inSampleSize *= 2
-            }
-        }
-        return inSampleSize
-    }
-
-    private fun showZoomOverlay(file: File) {
-        try {
-            // Prefer the annotated full image if AprilTag detection has finished.
-            val cached = lastAnnotatedFull
-            val bitmap = when {
-                cached != null && !cached.isRecycled -> cached
-                else -> BitmapFactory.decodeFile(file.absolutePath)
-            } ?: return
-            zoomImage.setImageBitmap(bitmap)
-            zoomOverlay.visibility = View.VISIBLE
-            isZoomOpen = true
-            // Switch the thumbnail to a live-view preview and keep it updating.
-            thumbnailUpdateHandler.post(thumbnailUpdateRunnable)
-            updateThumbnailWithLiveFrame()
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to load full image for zoom", e)
-            Toast.makeText(this, "Failed to open image", Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    private fun hideZoomOverlay() {
-        isZoomOpen = false
-        thumbnailUpdateHandler.removeCallbacks(thumbnailUpdateRunnable)
-        zoomOverlay.visibility = View.GONE
-        lastLiveThumbnail?.takeIf { !it.isRecycled }?.recycle()
-        lastLiveThumbnail = null
-        lastCapturedThumbnail?.let {
-            thumbnailLastCapture.setImageBitmap(it)
-        } ?: run {
-            thumbnailLastCapture.setImageDrawable(null)
-        }
-    }
-
-    /**
-     * Copy the current live preview frame into the thumbnail ImageView.
-     * Called on a background handler while the still-image zoom overlay is open.
-     * The thumbnail then acts as a "return to live view" button; tapping it hides
-     * the zoom overlay and restores the still-image thumbnail.
-     */
-    private fun updateThumbnailWithLiveFrame() {
-        val full = peekLatestPreviewBitmap() ?: return
-        try {
-            val viewHeight = thumbnailLastCapture.height.coerceAtLeast(72)
-            val aspect = full.width.toFloat() / full.height.toFloat()
-            val viewWidth = (viewHeight * aspect).toInt().coerceAtLeast(1)
-            val thumbnail = Bitmap.createScaledBitmap(full, viewWidth, viewHeight, true)
-            runOnUiThread {
-                lastLiveThumbnail?.takeIf { !it.isRecycled }?.recycle()
-                lastLiveThumbnail = thumbnail
-                thumbnailLastCapture.setImageBitmap(thumbnail)
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to update live thumbnail", e)
-        } finally {
-            full.recycle()
-        }
-    }
 
     private fun queuePermissionRequest(device: UsbDevice) {
         if (isEspDownloadModeDevice(device)) {
@@ -3706,22 +3742,20 @@ class DualCameraActivity : AppCompatActivity() {
         return nv21ToBitmap(frame.data, frame.width, frame.height)
     }
 
-    /**
-     * Peek at the latest NV21 preview frame without removing it from the queue,
-     * and convert it to an ARGB Bitmap. Used for the live-view thumbnail while
-     * the still-image zoom overlay is open, so it does not starve AprilTag detection.
-     */
-    private fun peekLatestPreviewBitmap(): Bitmap? {
-        val frame = previewFrameQueue.peek() ?: return null
-        return nv21ToBitmap(frame.data, frame.width, frame.height)
-    }
-
     private fun checkAndRequestPermissions() {
-        val permissions = arrayOf(
+        val permissions = mutableListOf(
             Manifest.permission.CAMERA,
             Manifest.permission.RECORD_AUDIO,
             Manifest.permission.MODIFY_AUDIO_SETTINGS
         )
+        // Reading the public MediaStore album on older/newer Android versions needs
+        // explicit permission; on Android 10-12 our own media is readable without it.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permissions.add(Manifest.permission.READ_MEDIA_IMAGES)
+            permissions.add(Manifest.permission.READ_MEDIA_VIDEO)
+        } else if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            permissions.add(Manifest.permission.READ_EXTERNAL_STORAGE)
+        }
 
         val permissionsToRequest = permissions.filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
@@ -4103,20 +4137,11 @@ class DualCameraActivity : AppCompatActivity() {
         }
         intent.getIntExtra(EXTRA_LIFECYCLE_TEST_COUNT, 0).let { count ->
             if (count > 0) {
-                val zoomMode = intent.getBooleanExtra(EXTRA_LIFECYCLE_ZOOM_TEST, false)
-                Log.d(TAG, "EXTRA_LIFECYCLE_TEST_COUNT=$count requested, zoomMode=$zoomMode")
-                runLifecycleTest(count, zoomMode)
+                Log.d(TAG, "EXTRA_LIFECYCLE_TEST_COUNT=$count requested")
+                runLifecycleTest(count)
             }
         }
 
-        if (intent.getBooleanExtra(EXTRA_ZOOM_OPEN, false)) {
-            Log.d(TAG, "EXTRA_ZOOM_OPEN requested")
-            lastCapturedFile?.let { showZoomOverlay(it) }
-        }
-        if (intent.getBooleanExtra(EXTRA_ZOOM_CLOSE, false)) {
-            Log.d(TAG, "EXTRA_ZOOM_CLOSE requested")
-            hideZoomOverlay()
-        }
         if (intent.getBooleanExtra(EXTRA_ANTI_BAND_NOW, false)) {
             val forcedHz = intent.getIntExtra(EXTRA_ANTI_BAND_HZ, 0).let { if (it > 0) it else null }
             Log.d(TAG, "EXTRA_ANTI_BAND_NOW requested, forcedHz=$forcedHz")
@@ -4168,6 +4193,8 @@ class DualCameraActivity : AppCompatActivity() {
         startMicMeter()
         startSpkMeter()
         mainHandler.post(firmwareVersionRunnable)
+        // Keep the thumbnail current with the public MediaStore/Google Photos album.
+        albumThumbnailHandler.post(albumThumbnailRunnable)
     }
 
     override fun onStop() {
@@ -4183,6 +4210,7 @@ class DualCameraActivity : AppCompatActivity() {
         mainHandler.removeCallbacks(devicePollRunnable)
         mainHandler.removeCallbacks(cameraHealthCheckRunnable)
         mainHandler.removeCallbacks(firmwareVersionRunnable)
+        albumThumbnailHandler.removeCallbacks(albumThumbnailRunnable)
         currentCamera?.closeCamera()
         currentCamera = null
         currentDevice = null
@@ -4200,10 +4228,9 @@ class DualCameraActivity : AppCompatActivity() {
         stopLiveAprilTagDetection()
         antiBandingTool?.stop()
         antiBandingTool = null
-        isZoomOpen = false
-        thumbnailUpdateHandler.removeCallbacks(thumbnailUpdateRunnable)
-        lastLiveThumbnail?.takeIf { !it.isRecycled }?.recycle()
-        lastLiveThumbnail = null
+        albumThumbnailHandler.removeCallbacks(albumThumbnailRunnable)
+        lastCapturedThumbnail?.takeIf { !it.isRecycled }?.recycle()
+        lastCapturedThumbnail = null
         cameraClient?.unRegister()
         cameraClient?.destroy()
         try {

@@ -79,21 +79,6 @@
                 android:text="Diagnostics..." />
         </ScrollView>
 
-        <!-- Zoom overlay for thumbnail: pinch/zoom/pan. Tap the live-view thumbnail to return. -->
-        <FrameLayout
-            android:id="@+id/zoom_overlay"
-            android:layout_width="match_parent"
-            android:layout_height="match_parent"
-            android:background="#E6000000"
-            android:visibility="gone"
-            android:clickable="true"
-            android:focusable="true">
-
-            <com.example.remotesupportheadset.PinchZoomPanImageView
-                android:id="@+id/zoom_image"
-                android:layout_width="match_parent"
-                android:layout_height="match_parent" />
-        </FrameLayout>
     </FrameLayout>
 
     <!-- Bottom control strip -->
