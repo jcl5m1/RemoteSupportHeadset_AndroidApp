@@ -2483,7 +2483,7 @@ class DualCameraActivity : AppCompatActivity() {
             val intent = Intent(Intent.ACTION_VIEW).apply {
                 setPackage("com.google.android.apps.photos")
                 setDataAndType(uri, mimeType)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
             if (intent.resolveActivity(packageManager) != null) {
                 startActivity(intent)
@@ -2496,7 +2496,7 @@ class DualCameraActivity : AppCompatActivity() {
         try {
             val fallback = Intent(Intent.ACTION_VIEW).apply {
                 setDataAndType(uri, mimeType)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
             startActivity(fallback)
         } catch (e: Exception) {
@@ -4737,8 +4737,19 @@ class DualCameraActivity : AppCompatActivity() {
         }, "AudioLoopbackIntent").start()
     }
 
+    override fun onResume() {
+        super.onResume()
+        Log.d(TAG, "onResume: currentCamera=${currentCamera != null}, currentDevice=${currentDevice != null}")
+    }
+
+    override fun onPause() {
+        super.onPause()
+        Log.d(TAG, "onPause")
+    }
+
     override fun onStart() {
         super.onStart()
+        Log.d(TAG, "onStart: videoTestMode=$videoTestMode, cameraClient=${cameraClient != null}, currentCamera=${currentCamera != null}")
         if (videoTestMode) {
             mainHandler.post(fpsRunnable)
             mainHandler.post(diagnosticsRunnable)
@@ -4749,7 +4760,16 @@ class DualCameraActivity : AppCompatActivity() {
                 startVideoFrameSource()
             }
         } else {
-            cameraClient?.register()
+            if (cameraClient == null) {
+                checkAndRequestPermissions()
+            } else {
+                cameraClient?.register()
+                // The library's dynamic attach receiver may not fire for a device that is
+                // already connected when we return from the background (e.g. after viewing
+                // a photo in Google Photos). Explicitly enumerate and request permission so
+                // the camera reconnects without requiring a manual unplug/replug.
+                updateDeviceList()
+            }
             mainHandler.post(fpsRunnable)
             mainHandler.post(diagnosticsRunnable)
             mainHandler.post(devicePollRunnable)
@@ -4764,6 +4784,7 @@ class DualCameraActivity : AppCompatActivity() {
 
     override fun onStop() {
         super.onStop()
+        Log.d(TAG, "onStop: videoTestMode=$videoTestMode, recordingState=$recordingState")
         if (recordingState != RecordingState.IDLE) {
             stopRecording()
         }
