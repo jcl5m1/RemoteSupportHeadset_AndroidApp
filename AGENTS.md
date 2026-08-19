@@ -412,5 +412,17 @@ You can also start the test source from **Settings → Video test source** while
 - `app/classes.txt` is a manually maintained inventory of resolved AAR/JAR dependencies; it is not used by the build. Update it if you want to keep it accurate.
 - CDC still-capture reliability depends on small (4 KiB) bulk reads and correct handling of the `STILL_END` trailer. Large single-request bulk transfers can leave the final bytes behind on this host/device pair.
 - If a firmware flash fails part-way through, the ESP32 may remain in ROM download mode (USB VID/PID `303a:0012`) and will not enumerate as a UVC+CDC device. When `adb shell dumpsys usb` shows `kernel_state=DISCONNECTED` and no `/sys/bus/usb/devices/*/idVendor` appears after reconnecting, press the **RST/RESET** button on the ESP32-P4 board to reboot into the application firmware (PID `0x4022`).
-- The Android USB host stack can get into a stalled state where it provides VBUS power (`host_connected=true`) but never enumerates the attached device (`kernel_state=DISCONNECTED`, no `USB_DEVICE_ATTACHED` intent). In that state, unplugging and replugging the device cable is not enough; you must **power-cycle the OTG adapter/hub itself** (unplug it from the phone, wait a moment, plug it back in) so the phone's USB host controller re-initialises.
-- A software-only recovery is also available via ADB shell. `svc usb resetUsbPort` resets the first connected USB host port, and `svc usb enableUsbDataSignal false && svc usb enableUsbDataSignal true` toggles the USB data lines. These do not require root and can be used by automated test scripts to recover from the Android-side stall without physical intervention.
+- The Android USB host stack can get into a stalled state where it provides VBUS power (`host_connected=true`) but never enumerates the attached device (`kernel_state=DISCONNECTED`, no `USB_DEVICE_ATTACHED` intent). In that state, unplugging and replugging the device cable is usually not enough.
+- **ADB OTG/host recovery (first try):** The phone can reset/power-cycle the host port from shell without root. Run the full sequence and wait for re-enumeration:
+  ```bash
+  adb shell "am force-stop com.example.remotesupportheadset; \
+             svc usb enableUsbDataSignal false; \
+             sleep 2; \
+             svc usb resetUsbPort; \
+             sleep 2; \
+             svc usb enableUsbDataSignal true; \
+             sleep 7; \
+             dumpsys usb | grep -E 'kernel_state|host_connected'"
+  ```
+  `enableUsbDataSignal false` drops the data lines, `resetUsbPort` resets the first host port, and `enableUsbDataSignal true` brings the PHY back up. The `sleep 7` gives the device time to re-enumerate. The automated test harnesses in `scripts/simulate_capture_lifecycle.py` and `scripts/simulate_record_lifecycle.py` use this same escalation.
+- **Physical OTG adapter/hub power-cycle (fallback):** If the ADB recovery leaves `kernel_state=DISCONNECTED`, power-cycle the OTG adapter/hub itself (unplug it from the phone, wait a moment, plug it back in) so the phone's USB host controller fully re-initialises.
