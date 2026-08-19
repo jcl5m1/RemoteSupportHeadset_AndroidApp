@@ -317,6 +317,45 @@ python3 scripts/parse_capture_timing.py /tmp/simcap/full_logcat.log
 
 The harness treats `FPS > 0` as the health signal, auto-recovers from a stalled Android USB host by escalating from `svc usb resetUsbPort` to `svc usb enableUsbDataSignal false && svc usb enableUsbDataSignal true`, and decodes logcat with replacement characters so binary CDC/UVC traffic cannot crash the reader. A recent run completed 100 randomized captures with 100/100 success and stream-resume.
 
+### Randomized full-app regression test
+
+`scripts/randomized_regression_test.py` is the preferred unattended regression suite. It exercises the app's intent-controllable surface in random order for a configurable number of state transitions:
+
+- still capture,
+- video record start/stop,
+- open gallery / return to live view,
+- AprilTag detection toggle,
+- YOLO person-detection toggle,
+- diagnostics panel toggle,
+- enter/exit video test source,
+- anti-banding analysis (short run).
+
+The harness maintains a state machine so only valid transitions are attempted, verifies health after each transition, auto-recovers from USB host stalls, and writes a JSON/CSV report plus timing histograms.
+
+Run a 100-transition regression pass (requires the same `scripts/.venv` with `matplotlib` and `numpy`):
+
+```bash
+cd scripts
+source .venv/bin/activate
+python3 randomized_regression_test.py --count 100 --seed 20260820 --output-dir /tmp/rrtest
+```
+
+Key options:
+
+- `--count N` — number of randomized actions (default 100).
+- `--seed N` — random seed for reproducible sequences (default: current time).
+- `--output-dir DIR` — directory for `report.json`, `results.csv`, `full_logcat.log`, and histogram PNGs.
+- `--skip-video-test` — do not enter video test source mode.
+
+The script pushes `scripts/test_video_assets/test_frames/` to the device automatically if the on-device directory does not exist. The intent extras used by the harness are documented in `DualCameraActivity.kt`:
+
+- `capture_now`, `record_start`, `record_stop`, `open_gallery`
+- `apriltag_enabled`, `yolo_enabled`, `diagnostics`
+- `video_test_path`, `exit_video_test`
+- `anti_band_now`
+
+A recent run completed 100/100 randomized transitions with no failures, recoveries, or crashes.
+
 ### Automated audio loopback qualification test
 
 `scripts/audio_loopback_test.py` is a host-side regression test for the Android app's USB audio path. The ESP32-P4 stays connected to the Android phone, and a MacBook provides the reference speaker and microphone:
@@ -397,7 +436,7 @@ adb shell am start -S -n com.example.remotesupportheadset/.DualCameraActivity \
     --es video_test_path /sdcard/Android/data/com.example.remotesupportheadset/files/TestFrames/
 ```
 
-You can also start the test source from **Settings → Video test source** while the app is running. It stops any open UVC camera and plays the persisted/default frame directory. Still image capture is disabled in video-test mode because it relies on the ESP32 CDC/UVC protocol.
+You can also start the test source from **Settings → Video test source** while the app is running. It stops any open UVC camera and plays the persisted/default frame directory. Still image capture is disabled in video-test mode because it relies on the ESP32 CDC/UVC protocol. To return to the live UVC camera programmatically, launch the activity with `--ez exit_video_test true`; this tears down the synthetic frame source, destroys the stale camera client, and re-initializes the UVC pipeline.
 
 ## Known limitations and gotchas
 
@@ -417,7 +456,7 @@ You can also start the test source from **Settings → Video test source** while
   ```bash
   python3 scripts/reset_android_otg.py --level 3 --wait 30
   ```
-  Exit code `0` means the ESP32 re-enumerated (`kernel_state=CONNECTED`, `lsusb` shows the Espressif device). The script is safe to call from the automated test harnesses whenever the camera is not healthy.
+  Exit code `0` means the ESP32 re-enumerated (`kernel_state=CONNECTED`, `lsusb` shows the Espressif device). The script is safe to call from the automated test harnesses whenever the camera is not healthy. `scripts/randomized_regression_test.py` integrates this recovery path automatically.
 - **Manual OTG/host recovery (if the script is unavailable):** The phone can reset/power-cycle the host port from shell without root. Run the full sequence and wait for re-enumeration:
   ```bash
   adb shell "am force-stop com.example.remotesupportheadset; \

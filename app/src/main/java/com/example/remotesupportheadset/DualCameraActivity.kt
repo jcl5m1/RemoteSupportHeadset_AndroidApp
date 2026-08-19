@@ -151,6 +151,12 @@ class DualCameraActivity : AppCompatActivity() {
         const val EXTRA_YOLO_ENABLED = "yolo_enabled"
         /** Intent extra that selects a directory of JPEG frames for the video test source. */
         const val EXTRA_VIDEO_TEST_PATH = "video_test_path"
+        /** Intent extra that exits video test source mode and returns to the live UVC camera. */
+        const val EXTRA_EXIT_VIDEO_TEST = "exit_video_test"
+        /** Intent extra that opens the most recent item in the Google Photos album. */
+        const val EXTRA_OPEN_GALLERY = "open_gallery"
+        /** Intent extra used by the randomized regression harness to tag the action name in logs. */
+        const val EXTRA_RR_ACTION = "rr_action"
 
         // Audio loopback qualification extras.
         /** Set to true to run an audio loopback test action instead of normal launch. */
@@ -394,6 +400,18 @@ class DualCameraActivity : AppCompatActivity() {
     private var pendingSimRecResumedStartTime = 0L
     private var pendingStartRecording = false
     private var skipGalleryOnRecordingStop = false
+
+    /**
+     * Return a short state string for the randomized regression harness.
+     */
+    private fun currentRrState(): String {
+        return when {
+            videoTestMode -> "VIDEO_TEST"
+            recordingState == RecordingState.RECORDING -> "RECORDING"
+            flashInProgress -> "FLASHING"
+            else -> "LIVE"
+        }
+    }
 
     // Firmware flash state
     private var flashInProgress = false
@@ -1100,6 +1118,10 @@ class DualCameraActivity : AppCompatActivity() {
      */
     private fun recoverCamera() {
         if (isFinishing || isDestroyed) return
+        if (videoTestMode) {
+            Log.d(TAG, "Recovery skipped: in video test mode")
+            return
+        }
         val now = SystemClock.elapsedRealtime()
         if (now - lastRecoveryTime < 15000L) {
             Log.d(TAG, "Recovery throttled, last attempt ${now - lastRecoveryTime}ms ago")
@@ -2546,6 +2568,22 @@ class DualCameraActivity : AppCompatActivity() {
     }
 
     /**
+     * Open the most recent item in the Google Photos album, used by the randomized
+     * regression harness to exercise the capture -> gallery -> return lifecycle.
+     */
+    private fun openLatestGalleryItemViaIntent() {
+        val latest = queryLatestMediaInAlbum(GOOGLE_PHOTOS_ALBUM_NAME)
+            ?: lastCapturedMediaUri?.let { it to "image/jpeg" }
+        if (latest != null) {
+            openInGooglePhotos(latest.first, latest.second)
+            Log.i(TAG, "RRTEST action=OPEN_GALLERY result=success uri=${latest.first}")
+        } else {
+            Log.w(TAG, "RRTEST action=OPEN_GALLERY result=failed reason=no_media")
+            Toast.makeText(this, "No photos yet", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /**
      * Find the most recent image or video in the public MediaStore album with
      * the given display name.  Returns its content URI and MIME type.
      */
@@ -2905,6 +2943,7 @@ class DualCameraActivity : AppCompatActivity() {
         mainHandler.removeCallbacks(hideHintRunnable)
 
         startVideoFrameSource()
+        Log.i(TAG, "RRTEST action=ENTER_VIDEO_TEST result=success")
     }
 
     /**
@@ -2938,6 +2977,40 @@ class DualCameraActivity : AppCompatActivity() {
         videoFrameSource = null
         cameraOpenedTime = 0L
         Log.d(TAG, "Video frame source stopped")
+    }
+
+    /**
+     * Exit video test source mode and return to the live UVC camera flow.
+     */
+    private fun exitVideoTestMode() {
+        Log.d(TAG, "Exiting video test mode")
+        stopVideoFrameSource()
+        videoTestMode = false
+        videoTestPath = ""
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            .edit()
+            .remove(PREF_VIDEO_TEST_PATH)
+            .apply()
+
+        // Restore the default live-camera UI state.
+        statusCamera.visibility = View.VISIBLE
+        statusCamera.text = "Waiting for camera..."
+        labelCamera.text = "Waiting..."
+        tapHint.visibility = View.VISIBLE
+        diagnosticsPanel.visibility = if (diagnosticsVisible) View.VISIBLE else View.GONE
+
+        // The old camera client was unregistered when entering video test mode.
+        // Destroy it so [initCameraClient] creates a fresh USB monitor on the way out.
+        pendingPermissionDevices.clear()
+        isRequestingPermission = false
+        cameraClient?.unRegister()
+        cameraClient?.destroy()
+        cameraClient = null
+
+        // Restart the UVC camera pipeline. Permissions are normally already granted
+        // at this point, so this re-initializes the USB monitor and surface callback.
+        checkAndRequestPermissions()
+        Log.i(TAG, "RRTEST action=EXIT_VIDEO_TEST result=success")
     }
 
     /**
@@ -3859,6 +3932,7 @@ class DualCameraActivity : AppCompatActivity() {
             aprilTagOverlay.detections = emptyList()
         }
         Log.d(TAG, "AprilTag detection ${if (enabled) "enabled" else "disabled"} (source=$source, persist=$persist)")
+        Log.i(TAG, "RRTEST action=TOGGLE_APRILTAG enabled=$enabled result=success")
     }
 
     private fun startLiveAprilTagDetection() {
@@ -3900,6 +3974,7 @@ class DualCameraActivity : AppCompatActivity() {
             aprilTagOverlay.yoloDetections = emptyList()
         }
         Log.d(TAG, "YOLO detection ${if (enabled) "enabled" else "disabled"} (source=$source, persist=$persist)")
+        Log.i(TAG, "RRTEST action=TOGGLE_YOLO enabled=$enabled result=success")
     }
 
     private fun startLiveYoloDetection() {
@@ -4703,6 +4778,7 @@ class DualCameraActivity : AppCompatActivity() {
             diagnosticsPanel.visibility = if (diagnosticsVisible) View.VISIBLE else View.GONE
             if (diagnosticsVisible) updateDiagnostics()
             Log.d(TAG, "EXTRA_DIAGNOSTICS=$diagnosticsVisible")
+            Log.i(TAG, "RRTEST action=TOGGLE_DIAGNOSTICS visible=$diagnosticsVisible result=success")
         }
 
         if (intent.hasExtra(EXTRA_APRILTAG_ENABLED)) {
@@ -4722,6 +4798,22 @@ class DualCameraActivity : AppCompatActivity() {
             if (!videoTestMode || videoTestPath != path) {
                 enterVideoTestMode(path)
             }
+        }
+
+        if (intent.getBooleanExtra(EXTRA_EXIT_VIDEO_TEST, false)) {
+            Log.d(TAG, "EXTRA_EXIT_VIDEO_TEST requested")
+            if (videoTestMode) {
+                exitVideoTestMode()
+            }
+        }
+
+        if (intent.getBooleanExtra(EXTRA_OPEN_GALLERY, false)) {
+            Log.d(TAG, "EXTRA_OPEN_GALLERY requested")
+            openLatestGalleryItemViaIntent()
+        }
+
+        intent.getStringExtra(EXTRA_RR_ACTION)?.let { action ->
+            Log.i(TAG, "RRTEST action=$action state=${currentRrState()}")
         }
 
         if (intent.getBooleanExtra(EXTRA_RECORD_START, false)) {
