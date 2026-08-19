@@ -6,8 +6,8 @@ Replaced the earlier per-view "Portrait preview" experiment with an Android-leve
 **Landscape mode** toggle. When enabled, the activity locks to landscape
 orientation, the control strip moves to the right side of the screen, and the
 camera preview scales so its vertical dimension fills the landscape display
-height. The feature is exposed as **Settings → Landscape mode** and defaults to
-off.
+height. The feature is exposed as a **rotation button** in the bottom-right
+corner and defaults to off.
 
 ## Why the change
 
@@ -27,7 +27,7 @@ normally-bottom control strip on the right.
 - `applyLandscapeMode()` sets `requestedOrientation` to
   `SCREEN_ORIENTATION_LANDSCAPE` when enabled and
   `SCREEN_ORIENTATION_PORTRAIT` when disabled.
-- Toggling the setting from the popup menu persists the value, applies the new
+- Tapping the rotation button toggles the value, persists it, applies the new
   orientation, and lets Android recreate the activity so the correct layout is
   loaded.
 
@@ -65,9 +65,10 @@ normally-bottom control strip on the right.
 
 - `app/src/main/java/com/example/remotesupportheadset/DualCameraActivity.kt`
 - `app/src/main/AndroidManifest.xml`
-- `app/src/main/res/menu/menu_settings.xml`
-- `app/src/main/res/values/strings.xml`
+- `app/src/main/res/layout/activity_dual_camera.xml`
 - `app/src/main/res/layout-land/activity_dual_camera.xml` (new)
+- `app/src/main/res/drawable/ic_screen_rotation.xml` (new)
+- `app/src/main/res/menu/menu_settings.xml`
 - `AGENTS.md`
 - `reports/landscape_mode_report.md` (new)
 

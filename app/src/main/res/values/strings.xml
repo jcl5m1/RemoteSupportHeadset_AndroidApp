@@ -8,5 +8,4 @@
     <string name="action_enable_apriltag">AprilTag detection</string>
     <string name="action_enable_yolo">Person detection</string>
     <string name="action_video_test_source">Video test source</string>
-    <string name="action_landscape_mode">Landscape mode</string>
 </resources>

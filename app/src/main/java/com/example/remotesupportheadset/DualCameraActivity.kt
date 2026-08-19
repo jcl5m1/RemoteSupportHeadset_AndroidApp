@@ -51,6 +51,7 @@ import android.view.View
 import android.widget.Button
 import androidx.appcompat.widget.PopupMenu
 import android.widget.EditText
+import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.ProgressBar
 import android.widget.ScrollView
@@ -179,6 +180,7 @@ class DualCameraActivity : AppCompatActivity() {
     private lateinit var diagnosticsText: TextView
     private lateinit var settingsButton: Button
     private lateinit var recordToggle: Button
+    private lateinit var rotationButton: ImageButton
     private lateinit var thumbnailLastCapture: ImageView
     private lateinit var thumbnailLabel: TextView
     private lateinit var micLevelMeter: ProgressBar
@@ -630,6 +632,7 @@ class DualCameraActivity : AppCompatActivity() {
         diagnosticsText = findViewById(R.id.diagnostics_text)
         settingsButton = findViewById(R.id.settings_button)
         recordToggle = findViewById(R.id.record_toggle)
+        rotationButton = findViewById(R.id.rotation_button)
         thumbnailLastCapture = findViewById(R.id.thumbnail_last_capture)
         thumbnailLabel = findViewById(R.id.thumbnail_label)
         micLevelMeter = findViewById(R.id.mic_level_meter)
@@ -707,6 +710,16 @@ class DualCameraActivity : AppCompatActivity() {
                 RecordingState.IDLE -> startRecording()
                 else -> stopRecording()
             }
+        }
+
+        rotationButton.setOnClickListener {
+            landscapeMode = !landscapeMode
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .edit()
+                .putBoolean(PREF_LANDSCAPE_MODE, landscapeMode)
+                .apply()
+            applyLandscapeMode()
+            Log.d(TAG, "Rotation button toggled landscape mode: enabled=$landscapeMode")
         }
 
         thumbnailLastCapture.setOnClickListener {
@@ -2540,7 +2553,6 @@ class DualCameraActivity : AppCompatActivity() {
             menu.findItem(R.id.action_diagnostics)?.isChecked = diagnosticsVisible
             menu.findItem(R.id.action_enable_apriltag)?.isChecked = aprilTagDetectionEnabled
             menu.findItem(R.id.action_enable_yolo)?.isChecked = yoloDetectionEnabled
-            menu.findItem(R.id.action_landscape_mode)?.isChecked = landscapeMode
             menu.findItem(R.id.action_anti_banding)?.title =
                 if (antiBandingTool?.isRunning == true) "Stop anti-banding" else "Anti-banding analysis"
             setOnMenuItemClickListener { item ->
@@ -2583,18 +2595,6 @@ class DualCameraActivity : AppCompatActivity() {
                     R.id.action_video_test_source -> {
                         Log.d(TAG, "Settings: video test source selected")
                         showVideoTestSourceDialog()
-                        true
-                    }
-                    R.id.action_landscape_mode -> {
-                        Log.d(TAG, "Settings: landscape mode selected")
-                        landscapeMode = !landscapeMode
-                        getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-                            .edit()
-                            .putBoolean(PREF_LANDSCAPE_MODE, landscapeMode)
-                            .apply()
-                        applyLandscapeMode()
-                        // The orientation change triggered by setRequestedOrientation
-                        // will recreate the activity and load the correct layout.
                         true
                     }
                     else -> false
