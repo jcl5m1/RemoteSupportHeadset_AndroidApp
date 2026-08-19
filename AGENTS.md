@@ -317,6 +317,39 @@ python3 scripts/parse_capture_timing.py /tmp/simcap/full_logcat.log
 
 The harness treats `FPS > 0` as the health signal, auto-recovers from a stalled Android USB host by escalating from `svc usb resetUsbPort` to `svc usb enableUsbDataSignal false && svc usb enableUsbDataSignal true`, and decodes logcat with replacement characters so binary CDC/UVC traffic cannot crash the reader. A recent run completed 100 randomized captures with 100/100 success and stream-resume.
 
+### Automated audio loopback qualification test
+
+`scripts/audio_loopback_test.py` is a host-side regression test for the Android app's USB audio path. The ESP32-P4 stays connected to the Android phone, and a MacBook provides the reference speaker and microphone:
+
+  1. MacBook plays a tone; the Android app records from the ESP32 microphone over USB.
+  2. Android app plays a tone through the ESP32 speaker over USB; MacBook records it.
+
+For each direction the script reports detected peak frequency, SNR, RMS level, and dropout duration. It exits non-zero and saves a PNG/JSON report if either direction fails the thresholds. The default thresholds are intentionally lenient on SNR so the test passes with the modest acoustic coupling of a MacBook speaker/mic; the critical regression signal is the absence of dropouts (packetised break-up).
+
+Run it from the repo root:
+
+```bash
+cd scripts
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+python3 audio_loopback_test.py \
+    --mac-speaker "MacBook Air Speakers" \
+    --mac-mic "MacBook Air Microphone" \
+    --duration 5 \
+    -o audio_loopback_report.png \
+    --report audio_loopback_report.json
+```
+
+The script defaults to `--mac-volume 75`, `--mac-input-volume 50`, and `--esp32-volume 75`. Raise `--mac-input-volume` or `--esp32-volume` if the acoustic path is weak, and lower them if the MacBook mic clips.
+
+Requirements on the MacBook host: `adb`, `SwitchAudioSource` (switchaudio-osx), `ffmpeg` with Audiotoolbox/AVFoundation support, and `numpy`/`matplotlib`.
+
+The Android side of the test is implemented by `AudioLoopbackTest.kt` and is triggered from `DualCameraActivity` via the ADB intent extras documented in `scripts/audio_loopback_test.py`. The ESP32 speaker volume is set directly on the ES8311 codec with the `spkvol` CDC command so it is independent of the host's UAC2 volume mapping.
+
+**Known choppiness remedies.** The microphone direction originally showed regular 5–10 ms dropouts (and occasional much larger gaps) while the camera preview was active. Root cause: the ESP32 audio tasks ran at FreeRTOS priority 5, the same as `video_task`, so camera work could starve the USB audio pipeline. The fix is to raise the audio task priorities to 7 in `audio_pipeline.c`. A second issue where the ESP32 speaker remained silent after a host mute request was fixed by unmuting the codec whenever a non-zero volume is set via `spkvol`.
+
 ## Development conventions
 
 - **Package**: `com.example.remotesupportheadset`.

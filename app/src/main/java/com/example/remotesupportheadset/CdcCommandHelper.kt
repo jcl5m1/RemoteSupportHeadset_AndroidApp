@@ -35,8 +35,8 @@ class CdcCommandHelper(
 
     companion object {
         private const val TAG = "CdcCommandHelper"
-        private const val VID_ESP = 0x303A
-        private const val PID_CDC_UVC = 0x4022
+        internal const val VID_ESP = 0x303A
+        internal const val PID_CDC_UVC = 0x4022
         private const val BAUD = 115200
         private const val BULK_TIMEOUT_MS = 500
 
@@ -235,6 +235,25 @@ class CdcCommandHelper(
      */
     fun queryFlickerMode(): String? {
         return sendCommand("flicker")
+    }
+
+    /**
+     * Set the ES8311 speaker volume directly as a percentage of the codec range.
+     * This bypasses the UAC2 dB mapping and locks the volume against host changes,
+     * which is useful for hardware-qualification tests that need a repeatable
+     * acoustic level.
+     */
+    fun setSpeakerVolume(percent: Int): String? {
+        val clamped = percent.coerceIn(0, 100)
+        return sendCommand("spkvol $clamped")
+    }
+
+    /**
+     * Restore a safe default volume and unlock UAC2 volume control.
+     */
+    fun resetSpeakerVolume(): String? {
+        sendCommand("spkvol 12")
+        return sendCommand("spkvol auto")
     }
 
     fun sendCommand(cmd: String): String? = synchronized(COMMAND_LOCK) {

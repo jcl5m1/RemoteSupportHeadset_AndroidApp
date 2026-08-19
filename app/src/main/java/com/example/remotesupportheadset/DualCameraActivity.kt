@@ -151,6 +151,20 @@ class DualCameraActivity : AppCompatActivity() {
         /** Intent extra that selects a directory of JPEG frames for the video test source. */
         const val EXTRA_VIDEO_TEST_PATH = "video_test_path"
 
+        // Audio loopback qualification extras.
+        /** Set to true to run an audio loopback test action instead of normal launch. */
+        const val EXTRA_AUDIO_LOOPBACK_TEST = "audio_loopback_test"
+        /** One of "record" or "play". */
+        const val EXTRA_AUDIO_LOOPBACK_ACTION = "audio_loopback_action"
+        /** Absolute path for the recorded WAV file (record) or ignored (play). */
+        const val EXTRA_AUDIO_LOOPBACK_OUTPUT = "audio_loopback_output"
+        /** Tone frequency in Hz for playback; default 1000. */
+        const val EXTRA_AUDIO_LOOPBACK_FREQ = "audio_loopback_freq"
+        /** Tone duration in milliseconds; default 5000. */
+        const val EXTRA_AUDIO_LOOPBACK_DURATION_MS = "audio_loopback_duration_ms"
+        /** ESP32 codec volume 0-100; default 75. */
+        const val EXTRA_AUDIO_LOOPBACK_VOLUME = "audio_loopback_volume"
+
         /** SharedPreferences file used for persistent app settings. */
         private const val PREFS_NAME = "RemoteSupportHeadsetPrefs"
         /** SharedPreferences key for the live AprilTag detection toggle. */
@@ -954,6 +968,21 @@ class DualCameraActivity : AppCompatActivity() {
         } catch (e: Exception) {
             Log.e(TAG, "Failed to set up CDC", e)
         }
+    }
+
+    /**
+     * Build a [CdcCommandHelper] wired to the currently selected UVC+CDC device.
+     * This is used by test/debug tools that need to send text commands to the
+     * firmware while the UVC stack owns the USB connection.
+     */
+    private fun createCdcCommandHelper(): CdcCommandHelper {
+        return CdcCommandHelper(
+            this,
+            currentDevice,
+            currentCtrlBlock?.connection,
+            cdcOutEndpoint,
+            cdcInEndpoint
+        )
     }
 
     /**
@@ -4616,6 +4645,65 @@ class DualCameraActivity : AppCompatActivity() {
             stopRecording()
             skipGalleryOnRecordingStop = false
         }
+
+        if (intent.getBooleanExtra(EXTRA_AUDIO_LOOPBACK_TEST, false)) {
+            val action = intent.getStringExtra(EXTRA_AUDIO_LOOPBACK_ACTION)
+            Log.d(TAG, "EXTRA_AUDIO_LOOPBACK_TEST requested, action=$action")
+            runAudioLoopbackTest(intent)
+        }
+    }
+
+    /**
+     * Run one side of the audio loopback qualification test from an ADB intent.
+     *
+     *   action="record" -> record from the ESP32 mic to [EXTRA_AUDIO_LOOPBACK_OUTPUT]
+     *   action="play"   -> play a 1 kHz tone through the ESP32 speaker
+     *
+     * The caller (a host script on a MacBook) is responsible for playing/capturing
+     * the acoustic reference on the MacBook side and for pulling the recorded WAV.
+     */
+    private fun runAudioLoopbackTest(intent: Intent) {
+        val action = intent.getStringExtra(EXTRA_AUDIO_LOOPBACK_ACTION) ?: return
+        val outputPath = intent.getStringExtra(EXTRA_AUDIO_LOOPBACK_OUTPUT)
+        val frequency = intent.getIntExtra(EXTRA_AUDIO_LOOPBACK_FREQ, 1000)
+        val durationMs = intent.getIntExtra(EXTRA_AUDIO_LOOPBACK_DURATION_MS, 5000)
+        val volume = intent.getIntExtra(EXTRA_AUDIO_LOOPBACK_VOLUME, 75)
+
+        Thread({
+            val helper = createCdcCommandHelper()
+            if (!helper.open()) {
+                Log.e(TAG, "AudioLoopbackTest: CDC channel not available")
+                return@Thread
+            }
+            val test = AudioLoopbackTest(this, helper)
+            val device = test.findUsbAudioDevice(action == "record")
+            if (device == null) {
+                Log.w(TAG, "AudioLoopbackTest: ESP32 USB audio device not found, using default routing")
+            }
+
+            when (action) {
+                "record" -> {
+                    val outFile = outputPath?.let { File(it) }
+                        ?: File(getExternalFilesDir(null), "audio_loopback_record.wav")
+                    outFile.parentFile?.mkdirs()
+                    Log.i(TAG, "AudioLoopbackTest: recording ${durationMs}ms to ${outFile.absolutePath}")
+                    test.recordFromDevice(device, durationMs / 1000.0, outFile) { success, error ->
+                        Log.i(TAG, "AudioLoopbackTest: record complete success=$success error=$error")
+                    }
+                }
+                "play" -> {
+                    val volResp = test.setSpeakerVolume(volume)
+                    Log.i(TAG, "AudioLoopbackTest: set speaker volume=$volume response=$volResp")
+                    Log.i(TAG, "AudioLoopbackTest: playing ${durationMs}ms tone at ${frequency}Hz")
+                    test.playToneToDevice(device, frequency.toDouble(), durationMs / 1000.0, amplitude = 0.5) { success, error ->
+                        Log.i(TAG, "AudioLoopbackTest: play complete success=$success error=$error")
+                        val resetResp = test.resetSpeakerVolume()
+                        Log.i(TAG, "AudioLoopbackTest: reset speaker volume response=$resetResp")
+                    }
+                }
+                else -> Log.w(TAG, "AudioLoopbackTest: unknown action '$action'")
+            }
+        }, "AudioLoopbackIntent").start()
     }
 
     override fun onStart() {
