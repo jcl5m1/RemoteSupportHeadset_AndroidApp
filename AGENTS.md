@@ -413,16 +413,21 @@ You can also start the test source from **Settings → Video test source** while
 - CDC still-capture reliability depends on small (4 KiB) bulk reads and correct handling of the `STILL_END` trailer. Large single-request bulk transfers can leave the final bytes behind on this host/device pair.
 - If a firmware flash fails part-way through, the ESP32 may remain in ROM download mode (USB VID/PID `303a:0012`) and will not enumerate as a UVC+CDC device. When `adb shell dumpsys usb` shows `kernel_state=DISCONNECTED` and no `/sys/bus/usb/devices/*/idVendor` appears after reconnecting, press the **RST/RESET** button on the ESP32-P4 board to reboot into the application firmware (PID `0x4022`).
 - The Android USB host stack can get into a stalled state where it provides VBUS power (`host_connected=true`) but never enumerates the attached device (`kernel_state=DISCONNECTED`, no `USB_DEVICE_ATTACHED` intent). In that state, unplugging and replugging the device cable is usually not enough.
-- **ADB OTG/host recovery (first try):** The phone can reset/power-cycle the host port from shell without root. Run the full sequence and wait for re-enumeration:
+- **Autonomous OTG recovery:** Use `scripts/reset_android_otg.py` from the MacBook host. It reads `dumpsys usb`, finds the first host port, and escalates from a soft port reset to a full data-signal toggle + app force-stop without requiring root:
+  ```bash
+  python3 scripts/reset_android_otg.py --level 3 --wait 30
+  ```
+  Exit code `0` means the ESP32 re-enumerated (`kernel_state=CONNECTED`, `lsusb` shows the Espressif device). The script is safe to call from the automated test harnesses whenever the camera is not healthy.
+- **Manual OTG/host recovery (if the script is unavailable):** The phone can reset/power-cycle the host port from shell without root. Run the full sequence and wait for re-enumeration:
   ```bash
   adb shell "am force-stop com.example.remotesupportheadset; \
              svc usb enableUsbDataSignal false; \
              sleep 2; \
-             svc usb resetUsbPort; \
+             svc usb resetUsbPort port0; \
              sleep 2; \
              svc usb enableUsbDataSignal true; \
              sleep 7; \
              dumpsys usb | grep -E 'kernel_state|host_connected'"
   ```
-  `enableUsbDataSignal false` drops the data lines, `resetUsbPort` resets the first host port, and `enableUsbDataSignal true` brings the PHY back up. The `sleep 7` gives the device time to re-enumerate. The automated test harnesses in `scripts/simulate_capture_lifecycle.py` and `scripts/simulate_record_lifecycle.py` use this same escalation.
+  `enableUsbDataSignal false` drops the data lines, `resetUsbPort port0` resets the first host port, and `enableUsbDataSignal true` brings the PHY back up. The `sleep 7` gives the device time to re-enumerate. The automated test harnesses in `scripts/simulate_capture_lifecycle.py` and `scripts/simulate_record_lifecycle.py` use this same escalation.
 - **Physical OTG adapter/hub power-cycle (fallback):** If the ADB recovery leaves `kernel_state=DISCONNECTED`, power-cycle the OTG adapter/hub itself (unplug it from the phone, wait a moment, plug it back in) so the phone's USB host controller fully re-initialises.

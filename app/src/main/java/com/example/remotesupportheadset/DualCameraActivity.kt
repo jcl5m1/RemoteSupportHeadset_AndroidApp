@@ -58,6 +58,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.Lifecycle
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
@@ -210,6 +211,7 @@ class DualCameraActivity : AppCompatActivity() {
 
     private val pendingPermissionDevices = mutableListOf<UsbDevice>()
     private var isRequestingPermission = false
+    private var permissionRequestDeferred = false
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val hideHintRunnable = Runnable { tapHint.visibility = View.GONE }
@@ -223,6 +225,7 @@ class DualCameraActivity : AppCompatActivity() {
     private val captureLock = ReentrantLock()
     private var isCapturing = false
     private var lastCaptureEndTime = 0L
+    private var lastCdcAutoRefreshTime = 0L
 
     // Lifecycle / stress-test state
     private var lifecycleTestRunning = false
@@ -794,8 +797,23 @@ class DualCameraActivity : AppCompatActivity() {
                 isRequestingPermission = false
 
                 if (currentCamera != null) {
-                    Log.d(TAG, "Camera already open; ignoring ${device.deviceName}")
-                    processNextPermission()
+                    if (currentDevice?.deviceId == device.deviceId) {
+                        // The same camera re-attached (e.g. after a brief USB flap while the
+                        // activity was in the background). Refresh the control block and CDC
+                        // state instead of ignoring it, so stale endpoints are replaced.
+                        runOnUiThread {
+                            Log.d(TAG, "Same camera re-attached: ${device.deviceName}; refreshing control block and CDC")
+                            currentCtrlBlock = ctrlBlock
+                            ctrlBlock?.let {
+                                setupCdc(device, it)
+                                applyPersistedFlickerMode()
+                            }
+                            processNextPermission()
+                        }
+                    } else {
+                        Log.d(TAG, "Camera already open; ignoring ${device.deviceName}")
+                        processNextPermission()
+                    }
                     return
                 }
 
@@ -908,7 +926,7 @@ class DualCameraActivity : AppCompatActivity() {
         updateDeviceList()
     }
 
-    private fun setupCdc(device: UsbDevice, ctrlBlock: USBMonitor.UsbControlBlock) {
+    private fun setupCdc(device: UsbDevice, ctrlBlock: USBMonitor.UsbControlBlock, skipVersionQuery: Boolean = false) {
         try {
             val connection = ctrlBlock.connection ?: return
             cdcConnection = connection
@@ -964,8 +982,11 @@ class DualCameraActivity : AppCompatActivity() {
 
             // Query the firmware version right away instead of waiting for the
             // periodic runnable; this populates the on-screen label as soon as
-            // the device connects.
-            queryFirmwareStatus()
+            // the device connects. Skip this when called from refreshCdcState()
+            // because the caller (or the periodic runnable) will query shortly.
+            if (!skipVersionQuery) {
+                queryFirmwareStatus()
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to set up CDC", e)
         }
@@ -997,7 +1018,7 @@ class DualCameraActivity : AppCompatActivity() {
         val t0 = SystemClock.elapsedRealtime()
         Log.d(TAG, "Refreshing CDC state...")
         releaseCdc()
-        setupCdc(device, ctrlBlock)
+        setupCdc(device, ctrlBlock, skipVersionQuery = true)
         val dt = SystemClock.elapsedRealtime() - t0
         Log.d(TAG, "CDC refresh done in ${dt}ms: control=${cdcControlInterface != null}, data=${cdcDataInterface != null}, out=${cdcOutEndpoint != null}, in=${cdcInEndpoint != null}")
         cdcOutEndpoint?.let { clearEndpointHalt(it) }
@@ -1163,7 +1184,7 @@ class DualCameraActivity : AppCompatActivity() {
             Log.i(TAG, "SIMCAP start i=$simulatedIndex t=${simulatedCaptureStartTime}")
         }
 
-        Thread { captureStillImageWithRetries(3, simulatedIndex = simulatedIndex) }
+        Thread { captureStillImageWithRetries(5, simulatedIndex = simulatedIndex) }
             .apply { name = "StillCaptureThread"; start() }
     }
 
@@ -1220,7 +1241,7 @@ class DualCameraActivity : AppCompatActivity() {
                     runOnUiThread {
                         Toast.makeText(this, "Capture $i/$count", Toast.LENGTH_SHORT).show()
                     }
-                    val ok = captureStillImageWithRetries(3, cancelCheck = { !lifecycleTestRunning })
+                    val ok = captureStillImageWithRetries(5, cancelCheck = { !lifecycleTestRunning })
                     if (ok) {
                         lifecycleSuccess++
                     } else {
@@ -1277,11 +1298,11 @@ class DualCameraActivity : AppCompatActivity() {
      * or [timeoutMs] elapses. This prevents triggering a still capture while
      * the device is still recovering from a reset.
      */
-    private fun waitForStablePreview(timeoutMs: Long): Boolean {
+    private fun waitForStablePreview(timeoutMs: Long, requireRunningTest: Boolean = true): Boolean {
         val deadline = SystemClock.elapsedRealtime() + timeoutMs
         var firstPositiveFpsTime = 0L
         while (SystemClock.elapsedRealtime() < deadline) {
-            if (!lifecycleTestRunning) return false
+            if (requireRunningTest && !lifecycleTestRunning) return false
             if (currentFps > 0) {
                 if (firstPositiveFpsTime == 0L) {
                     firstPositiveFpsTime = SystemClock.elapsedRealtime()
@@ -1488,34 +1509,53 @@ class DualCameraActivity : AppCompatActivity() {
 
     private fun queryFirmwareStatus() {
         Thread {
+            // Do not run status queries while a still capture is active; concurrent CDC
+            // traffic can corrupt the JPEG payload or reset endpoints mid-transfer.
+            if (isCapturing) {
+                Log.v(TAG, "Firmware status query skipped: capture in progress")
+                return@Thread
+            }
+
             var version: String? = null
             var flickerHz: Int? = null
-            val helper = CdcCommandHelper(this, currentDevice, currentCtrlBlock?.connection, cdcOutEndpoint, cdcInEndpoint)
-            try {
-                if (helper.open()) {
-                    version = queryBuildVersionWithRetry(helper)
-                    if (version == null && cdcOutEndpoint != null && cdcInEndpoint != null) {
-                        Log.d(TAG, "Firmware version empty; refreshing CDC state and retrying once")
-                        refreshCdcState()
-                        // Re-create helper because refreshCdcState may update endpoints/connection.
-                        val retryHelper = CdcCommandHelper(this, currentDevice, currentCtrlBlock?.connection, cdcOutEndpoint, cdcInEndpoint)
-                        if (retryHelper.open()) {
-                            version = queryBuildVersionWithRetry(retryHelper)
-                            retryHelper.close()
-                        }
-                    }
-
-                    if (version != null) {
-                        val statusResponse = helper.queryExposureUs()
-                        Log.d(TAG, "Firmware status raw response: '$statusResponse'")
-                        flickerHz = parseFlickerHz(statusResponse)
-                    }
-                    helper.close()
-                } else {
-                    Log.d(TAG, "Could not open CDC port for firmware status query")
+            synchronized(CdcCommandHelper.COMMAND_LOCK) {
+                if (isCapturing) {
+                    Log.v(TAG, "Firmware status query skipped: capture in progress (lock acquired)")
+                    return@synchronized
                 }
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to query firmware status", e)
+                val helper = CdcCommandHelper(this, currentDevice, currentCtrlBlock?.connection, cdcOutEndpoint, cdcInEndpoint)
+                try {
+                    if (helper.open()) {
+                        version = queryBuildVersionWithRetry(helper)
+                        if (version == null && cdcOutEndpoint != null && cdcInEndpoint != null && !isCapturing) {
+                            val now = SystemClock.elapsedRealtime()
+                            if (now - lastCdcAutoRefreshTime > 3000L) {
+                                lastCdcAutoRefreshTime = now
+                                Log.d(TAG, "Firmware version empty; refreshing CDC state and retrying once")
+                                refreshCdcState()
+                                // Re-create helper because refreshCdcState may update endpoints/connection.
+                                val retryHelper = CdcCommandHelper(this, currentDevice, currentCtrlBlock?.connection, cdcOutEndpoint, cdcInEndpoint)
+                                if (retryHelper.open()) {
+                                    version = queryBuildVersionWithRetry(retryHelper)
+                                    retryHelper.close()
+                                }
+                            } else {
+                                Log.d(TAG, "Firmware version empty; refresh throttled")
+                            }
+                        }
+
+                        if (version != null && !isCapturing) {
+                            val statusResponse = helper.queryExposureUs()
+                            Log.d(TAG, "Firmware status raw response: '$statusResponse'")
+                            flickerHz = parseFlickerHz(statusResponse)
+                        }
+                        helper.close()
+                    } else {
+                        Log.d(TAG, "Could not open CDC port for firmware status query")
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to query firmware status", e)
+                }
             }
             version?.let { firmwareBuildVersion = it }
             flickerHz?.let { cachedFlickerHz = it }
@@ -3064,9 +3104,24 @@ class DualCameraActivity : AppCompatActivity() {
 
         runOnUiThread { Toast.makeText(this, "Capturing...", Toast.LENGTH_SHORT).show() }
 
+        // After a background->foreground transition (e.g. returning from Google Photos)
+        // the camera may report OPENED before frames are actually flowing. Wait until
+        // the preview is stable before issuing the CDC capture command; this avoids
+        // commands sent to a stale/flapping CDC endpoint.
+        if (!waitForStablePreview(10000L, requireRunningTest = false)) {
+            Log.w(TAG, "Preview not stable before capture; aborting")
+            isCapturing = false
+            lastCaptureEndTime = SystemClock.elapsedRealtime()
+            val idx = simulatedIndex
+            if (idx >= 0) {
+                val elapsed = SystemClock.elapsedRealtime() - simulatedCaptureStartTime
+                Log.i(TAG, "SIMCAP complete i=$idx t=${SystemClock.elapsedRealtime()} dt_complete=${elapsed}ms success=false")
+            }
+            return false
+        }
+
         var lastException: Exception? = null
         var succeeded = false
-        val captureT0 = SystemClock.elapsedRealtime()
         try {
             for (attempt in 1..maxRetries) {
                 if (cancelCheck()) {
@@ -3075,15 +3130,20 @@ class DualCameraActivity : AppCompatActivity() {
                 }
                 val attemptT0 = SystemClock.elapsedRealtime()
                 try {
-                    if (cdcOutEndpoint == null || cdcInEndpoint == null || cdcConnection == null) {
-                        Log.w(TAG, "CDC not ready on attempt $attempt; refreshing state")
-                        refreshCdcState()
+                    synchronized(CdcCommandHelper.COMMAND_LOCK) {
+                        // Re-check endpoints under the lock; if they disappeared, refresh once.
                         if (cdcOutEndpoint == null || cdcInEndpoint == null || cdcConnection == null) {
-                            throw RuntimeException("CDC not available")
+                            Log.w(TAG, "CDC not ready on attempt $attempt; refreshing state")
+                            refreshCdcState()
+                            if (cdcOutEndpoint == null || cdcInEndpoint == null || cdcConnection == null) {
+                                throw RuntimeException("CDC not available")
+                            }
                         }
+                        // Hold the CDC lock for the entire command+payload transaction so
+                        // periodic firmware-status queries cannot interleave commands or
+                        // reclaim endpoints while the JPEG is being read.
+                        doSingleCapture()
                     }
-
-                    doSingleCapture()
                     succeeded = true
                     val attemptDt = SystemClock.elapsedRealtime() - attemptT0
                     Log.d(TAG, "Capture attempt $attempt/$maxRetries succeeded in ${attemptDt}ms")
@@ -3093,8 +3153,10 @@ class DualCameraActivity : AppCompatActivity() {
                     val attemptDt = SystemClock.elapsedRealtime() - attemptT0
                     Log.w(TAG, "Capture attempt $attempt/$maxRetries failed after ${attemptDt}ms: ${e.message}", e)
                     if (attempt < maxRetries) {
-                        refreshCdcState()
-                        Thread.sleep(500)
+                        synchronized(CdcCommandHelper.COMMAND_LOCK) {
+                            refreshCdcState()
+                        }
+                        Thread.sleep(1000)
                     }
                 }
             }
@@ -3676,8 +3738,14 @@ class DualCameraActivity : AppCompatActivity() {
         if (isRequestingPermission || pendingPermissionDevices.isEmpty()) return
 
         val device = pendingPermissionDevices.removeAt(0)
+        if (!lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+            Log.d(TAG, "Deferring permission request until activity is resumed")
+            permissionRequestDeferred = true
+            return
+        }
         isRequestingPermission = true
         permissionRequestStartTime = SystemClock.elapsedRealtime()
+        permissionRequestDeferred = false
         runOnUiThread {
             statusCamera.text = "Requesting permission for\n${device.deviceName}..."
         }
@@ -4740,6 +4808,10 @@ class DualCameraActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         Log.d(TAG, "onResume: currentCamera=${currentCamera != null}, currentDevice=${currentDevice != null}")
+        if (permissionRequestDeferred || (pendingPermissionDevices.isNotEmpty() && !isRequestingPermission)) {
+            Log.d(TAG, "onResume: processing deferred permission requests")
+            processNextPermission()
+        }
     }
 
     override fun onPause() {

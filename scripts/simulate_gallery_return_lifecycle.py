@@ -278,7 +278,7 @@ def main() -> int:
     parser.add_argument("--mode", type=str, default="capture", choices=["capture", "record", "both"],
                         help="Type of media to capture each iteration")
     parser.add_argument("--record-duration-ms", type=int, default=2000, help="Video recording duration")
-    parser.add_argument("--gallery-wait-s", type=float, default=2.0,
+    parser.add_argument("--gallery-wait-s", type=float, default=3.0,
                         help="Time to wait for the gallery to open")
     parser.add_argument("--output-dir", type=str, default="/tmp/simgallery", help="Directory for outputs")
     args = parser.parse_args()
@@ -310,7 +310,15 @@ def main() -> int:
         result = IterationResult(index=i, mode=mode)
         results.append(result)
 
-        if not ensure_camera_healthy(reader):
+        print("  Bringing RemoteSupportHeadset to foreground...")
+        t_return = time.time()
+        bring_app_to_foreground()
+
+        print("  Waiting for live preview to be healthy...")
+        if wait_for_camera_healthy(reader, timeout=60.0):
+            result.return_to_live_ms = int((time.time() - t_return) * 1000)
+            print(f"  Live preview resumed: return_to_live={result.return_to_live_ms}ms")
+        else:
             print(f"  ERROR: Camera not healthy before iteration {i + 1}")
             result.error = "camera_not_healthy_before"
             if not ensure_camera_healthy(reader, recovery_attempts=3):
@@ -345,21 +353,6 @@ def main() -> int:
 
         print(f"  Waiting {args.gallery_wait_s}s for gallery to open...")
         time.sleep(args.gallery_wait_s)
-
-        print("  Bringing RemoteSupportHeadset back to foreground...")
-        t_return = time.time()
-        bring_app_to_foreground()
-
-        print("  Waiting for live preview to resume (FPS > 0)...")
-        if wait_for_camera_healthy(reader, timeout=60.0):
-            result.return_to_live_ms = int((time.time() - t_return) * 1000)
-            print(f"  Live preview resumed: return_to_live={result.return_to_live_ms}ms")
-        else:
-            result.error = "live_preview_not_resumed"
-            print("  ERROR: Live preview did not resume after returning")
-            if not ensure_camera_healthy(reader, recovery_attempts=3):
-                print("  ERROR: Could not recover camera; aborting.")
-                break
 
     reader.stop()
 

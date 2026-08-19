@@ -47,7 +47,7 @@ class CdcCommandHelper(
          *  firmware processes commands in order and we need each command's
          *  response to be read by the thread that sent it.
          */
-        private val COMMAND_LOCK = Any()
+        internal val COMMAND_LOCK = Any()
     }
 
     private val usbManager: UsbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
