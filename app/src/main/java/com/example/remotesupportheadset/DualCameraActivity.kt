@@ -402,6 +402,7 @@ class DualCameraActivity : AppCompatActivity() {
     private val pendingFlashFiles = mutableListOf<Pair<String, Int>>()
     private var flashTotalBytes = 0L
     private var flashProgressBytesWritten = 0L
+    private var flashBootloaderSentMs = 0L
 
     // Cached firmware build version and flicker frequency reported by the ESP32 over CDC.
     @Volatile
@@ -1936,7 +1937,10 @@ class DualCameraActivity : AppCompatActivity() {
                 runOnUiThread {
                     updateFlashProgress("Waiting for download mode...")
                     registerFlashReceiver()
-                    mainHandler.postDelayed(findDownloadDeviceRunnable, 500)
+                    // Give the ESP32 time to reset and re-enumerate in ROM download mode
+                    // before we start polling. 500 ms is often too short.
+                    flashBootloaderSentMs = SystemClock.elapsedRealtime()
+                    mainHandler.postDelayed(findDownloadDeviceRunnable, 2000)
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to send bootloader command", e)
@@ -1975,12 +1979,19 @@ class DualCameraActivity : AppCompatActivity() {
             if (!flashInProgress) return
 
             val usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
-            val candidates = usbManager.deviceList.values.filter {
+            val allEspressif = usbManager.deviceList.values.filter {
                 it.vendorId == ESPRESSIF_VID
             }
-            if (candidates.isNotEmpty()) {
-                for (d in candidates) {
-                    Log.d(TAG, "Flash poll found Espressif device: ${d.deviceName} " +
+            val downloadCandidates = allEspressif.filter {
+                it.productId == ESPRESSIF_DOWNLOAD_PID
+            }
+
+            // Log every Espressif device we see so we can tell whether the
+            // bootloader command actually produced a download-mode device.
+            if (allEspressif.isNotEmpty()) {
+                for (d in allEspressif) {
+                    val mode = if (d.productId == ESPRESSIF_DOWNLOAD_PID) "DOWNLOAD" else "APP/UVC"
+                    Log.d(TAG, "Flash poll found Espressif device ($mode): ${d.deviceName} " +
                             "VID=${d.vendorId} PID=${d.productId} " +
                             "class=${d.deviceClass}/${d.deviceSubclass}/${d.deviceProtocol} " +
                             "interfaces=${d.interfaceCount}")
@@ -1996,7 +2007,7 @@ class DualCameraActivity : AppCompatActivity() {
                 }
             }
 
-            val device = candidates.firstOrNull()
+            val device = downloadCandidates.firstOrNull()
             if (device != null) {
                 mainHandler.removeCallbacks(this)
                 updateFlashProgress("Found download-mode device ${device.productId}")
@@ -2005,10 +2016,25 @@ class DualCameraActivity : AppCompatActivity() {
                 } else {
                     requestFlashPermission(device)
                 }
-            } else {
-                updateFlashProgress("Waiting for download mode...")
-                mainHandler.postDelayed(this, 500)
+                return
             }
+
+            val elapsed = SystemClock.elapsedRealtime() - flashBootloaderSentMs
+            if (elapsed > 15000) {
+                mainHandler.removeCallbacks(this)
+                val appMode = allEspressif.firstOrNull { it.productId == ESPRESSIF_UVC_CDC_PID }
+                val message = if (appMode != null) {
+                    "ESP32 returned in app mode (PID 0x${ESPRESSIF_UVC_CDC_PID.toString(16)}); bootloader did not enter download mode"
+                } else {
+                    "ESP32 did not re-enumerate in download mode within 15 s"
+                }
+                Log.e(TAG, message)
+                finishFlashFlow(false, message)
+                return
+            }
+
+            updateFlashProgress("Waiting for download mode... (${elapsed / 1000}s)")
+            mainHandler.postDelayed(this, 500)
         }
     }
 
@@ -2064,6 +2090,11 @@ class DualCameraActivity : AppCompatActivity() {
     }
 
     private fun openDownloadDeviceAndFlash(device: UsbDevice) {
+        if (device.vendorId != ESPRESSIF_VID || device.productId != ESPRESSIF_DOWNLOAD_PID) {
+            Log.e(TAG, "Refusing to flash non-download-mode device: VID=${device.vendorId} PID=${device.productId}")
+            finishFlashFlow(false, "ESP32 not in download mode (PID 0x${device.productId.toString(16)})")
+            return
+        }
         Log.d(TAG, "Opening download-mode device ${device.deviceName} PID=${device.productId}")
         val usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
         val connection = usbManager.openDevice(device) ?: run {
