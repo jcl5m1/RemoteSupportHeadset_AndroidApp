@@ -2837,8 +2837,9 @@ class DualCameraActivity : AppCompatActivity() {
         Thread {
             if (!waitForCdcReady(5000)) {
                 runOnUiThread {
-                    dialog.setMessage("CDC channel not ready. Try again after the camera is fully connected.")
-                    dialog.setButton(AlertDialog.BUTTON_NEGATIVE, "Close") { _, _ -> dialog.dismiss() }
+                    val message = "CDC channel not ready. Try again after the camera is fully connected."
+                    dialog.dismiss()
+                    Toast.makeText(this, message, Toast.LENGTH_LONG).show()
                 }
                 return@Thread
             }
@@ -2862,19 +2863,20 @@ class DualCameraActivity : AppCompatActivity() {
             tool.onResult = { result ->
                 cachedFlickerHz = result.flickerHz
                 lastAntiBandingFlickerHz = result.flickerHz
+                if (diagnosticsVisible) updateDiagnostics()
+            }
+            tool.onFinished = { success, message ->
+                val summary = if (success && message != null) {
+                    message
+                } else if (message != null) {
+                    "Anti-banding finished: $message"
+                } else {
+                    "Anti-banding finished"
+                }
+                Log.i(TAG, summary)
                 runOnUiThread {
-                    if (diagnosticsVisible) updateDiagnostics()
-                    dialog.setMessage(
-                        "Done.\nFlicker: ${result.flickerHz} Hz\n" +
-                                "ESP32 exposure: ${result.esp32Us.toInt()} us\n" +
-                                "Android servo: ${result.androidUs} us\n" +
-                                "Metric: %.4f".format(result.androidMetric) + "\n" +
-                                "Mean intensity: %.1f".format(result.androidMean)
-                    )
-                    dialog.setButton(AlertDialog.BUTTON_NEGATIVE, "Close") { _, _ ->
-                        tool.stop()
-                        dialog.dismiss()
-                    }
+                    dialog.dismiss()
+                    Toast.makeText(this, summary, Toast.LENGTH_LONG).show()
                 }
             }
             tool.start()
@@ -3917,7 +3919,10 @@ class DualCameraActivity : AppCompatActivity() {
      * which also stops the grayscale Y-plane downsampling compute.
      */
     private fun setAprilTagDetectionEnabled(enabled: Boolean, source: String = "intent", persist: Boolean = true) {
-        if (aprilTagDetectionEnabled == enabled) return
+        if (aprilTagDetectionEnabled == enabled) {
+            Log.i(TAG, "RRTEST action=TOGGLE_APRILTAG enabled=$enabled result=success")
+            return
+        }
         aprilTagDetectionEnabled = enabled
         if (persist) {
             getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
@@ -3959,7 +3964,10 @@ class DualCameraActivity : AppCompatActivity() {
      * toggled from Settings or via the [EXTRA_YOLO_ENABLED] intent extra.
      */
     private fun setYoloDetectionEnabled(enabled: Boolean, source: String = "intent", persist: Boolean = true) {
-        if (yoloDetectionEnabled == enabled) return
+        if (yoloDetectionEnabled == enabled) {
+            Log.i(TAG, "RRTEST action=TOGGLE_YOLO enabled=$enabled result=success")
+            return
+        }
         yoloDetectionEnabled = enabled
         if (persist) {
             getSharedPreferences(PREFS_NAME, MODE_PRIVATE)

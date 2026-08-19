@@ -34,6 +34,8 @@ class AntiBandingTool(
     var onLog: ((String) -> Unit)? = null
     var onProgress: ((String) -> Unit)? = null
     var onResult: ((Result) -> Unit)? = null
+    /** Called once when the servo finishes, regardless of success/failure. */
+    var onFinished: ((success: Boolean, message: String?) -> Unit)? = null
 
     @Volatile
     private var running = false
@@ -64,6 +66,8 @@ class AntiBandingTool(
     private fun runServo() {
         var espComputedUs = 0f
         var flickerHz = 0
+        var finishedSuccessfully = false
+        var finishedMessage: String? = null
 
         try {
             val cdcOk = cdcCommandHelper.open()
@@ -115,13 +119,15 @@ class AntiBandingTool(
             }
 
             if (coarseResults.isEmpty()) {
-                log("No valid measurements; aborting.")
+                finishedMessage = "No valid measurements; aborting."
+                log(finishedMessage)
                 return
             }
 
             val coarseBest = coarseResults.minByOrNull { it.second }
             if (coarseBest == null) {
-                log("Could not determine coarse best; aborting.")
+                finishedMessage = "Could not determine coarse best; aborting."
+                log(finishedMessage)
                 return
             }
             log("Coarse best: ${coarseBest.first} us metric=${coarseBest.second}")
@@ -174,27 +180,31 @@ class AntiBandingTool(
                             "ANDROID_MEAN=%.1f ".format(meanAtBest) +
                             "DIFF_US=${diff.toInt()}"
                 )
-                onResult?.invoke(
-                    Result(
-                        flickerHz = flickerHz,
-                        esp32Us = espComputedUs,
-                        androidUs = finalBest.first,
-                        androidMetric = finalBest.second,
-                        androidMean = meanAtBest,
-                        diffUs = diff.toInt()
-                    )
+                val result = Result(
+                    flickerHz = flickerHz,
+                    esp32Us = espComputedUs,
+                    androidUs = finalBest.first,
+                    androidMetric = finalBest.second,
+                    androidMean = meanAtBest,
+                    diffUs = diff.toInt()
                 )
+                finishedSuccessfully = true
+                finishedMessage = summary.trim()
+                onResult?.invoke(result)
             }
         } catch (e: InterruptedException) {
             Thread.currentThread().interrupt()
-            Log.w(TAG, "Anti-banding servo interrupted", e)
+            finishedMessage = "Anti-banding interrupted"
+            Log.w(TAG, finishedMessage, e)
         } catch (e: Exception) {
+            finishedMessage = "Anti-banding failed: ${e.message}"
             Log.e(TAG, "Anti-banding servo failed", e)
-            log("Anti-banding failed: ${e.message}")
+            log(finishedMessage)
         } finally {
             running = false
             cdcCommandHelper.close()
             log("Anti-banding servo finished.")
+            onFinished?.invoke(finishedSuccessfully, finishedMessage)
         }
     }
 
